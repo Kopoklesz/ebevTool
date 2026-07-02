@@ -1,0 +1,4 @@
+openpyxl
+tkinterdnd2
+cryptography
+requests
