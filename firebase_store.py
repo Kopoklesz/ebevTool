@@ -1,5 +1,6 @@
 import hashlib
 import json
+import uuid
 from datetime import datetime, timezone
 
 import requests
@@ -13,6 +14,9 @@ TIMEOUT = 15
 
 # Consumed rekordok megőrzési ideje hónapban (fél év)
 RETENTION_MONTHS = 6
+
+# Firestore commit végpontonkénti írás-limit
+BATCH_LIMIT = 500
 
 
 class FirebaseError(Exception):
@@ -76,9 +80,13 @@ class FirebaseStore:
     def __init__(self, api_key, project_id, fernet_key):
         self.api_key = api_key
         self.fernet = Fernet(fernet_key)
-        self.doc_base = (f'{FIRESTORE_BASE}/projects/{project_id}'
-                         f'/databases/(default)/documents')
+        self.doc_root = f'projects/{project_id}/databases/(default)/documents'
+        self.doc_base = f'{FIRESTORE_BASE}/{self.doc_root}'
         self.id_token = None
+        # Kapcsolat-újrahasznosítás (keep-alive): egy munkamenetben sok egymást
+        # követő Firestore hívás történik, session nélkül mindegyik új TCP/TLS
+        # kapcsolatot nyitna.
+        self.session = requests.Session()
 
     # --- kapcsolat ---
 
@@ -87,8 +95,8 @@ class FirebaseStore:
         if self.id_token:
             return
         try:
-            r = requests.post(f'{IDENTITY_URL}?key={self.api_key}',
-                              json={'returnSecureToken': True}, timeout=TIMEOUT)
+            r = self.session.post(f'{IDENTITY_URL}?key={self.api_key}',
+                                  json={'returnSecureToken': True}, timeout=TIMEOUT)
             r.raise_for_status()
             self.id_token = r.json()['idToken']
         except Exception as e:
@@ -97,7 +105,7 @@ class FirebaseStore:
     def _request(self, method, path, *, params=None, json_body=None):
         self.sign_in()
         try:
-            r = requests.request(
+            r = self.session.request(
                 method, f'{self.doc_base}/{path}',
                 headers={'Authorization': f'Bearer {self.id_token}'},
                 params=params, json=json_body, timeout=TIMEOUT)
@@ -124,6 +132,56 @@ class FirebaseStore:
             if not page_token:
                 break
         return docs
+
+    def _batch_get(self, paths):
+        """Több dokumentum egyetlen kéréssel; visszaadja a létező dokumentumokat
+        {relatív_path: doc} alakban (a hiányzók nem szerepelnek)."""
+        if not paths:
+            return {}
+        self.sign_in()
+        names = [f'{self.doc_root}/{p}' for p in paths]
+        try:
+            r = self.session.post(
+                f'{self.doc_base}:batchGet',
+                headers={'Authorization': f'Bearer {self.id_token}'},
+                json={'documents': names}, timeout=TIMEOUT)
+        except Exception as e:
+            raise FirebaseError(f'Firestore batchGet hívás sikertelen: {e}') from e
+        if not r.ok:
+            raise FirebaseError(f'Firestore batchGet hiba ({r.status_code}): {r.text[:300]}')
+        found = {}
+        for item in r.json():
+            doc = item.get('found')
+            if doc:
+                path = doc['name'].split('/documents/', 1)[1]
+                found[path] = doc
+        return found
+
+    def _commit(self, writes):
+        """Több írás/törlés egy vagy több kötegelt (:commit) kérésben."""
+        if not writes:
+            return
+        self.sign_in()
+        for i in range(0, len(writes), BATCH_LIMIT):
+            chunk = writes[i:i + BATCH_LIMIT]
+            try:
+                r = self.session.post(
+                    f'{self.doc_base}:commit',
+                    headers={'Authorization': f'Bearer {self.id_token}'},
+                    json={'writes': chunk}, timeout=TIMEOUT)
+            except Exception as e:
+                raise FirebaseError(f'Firestore commit hívás sikertelen: {e}') from e
+            if not r.ok:
+                raise FirebaseError(f'Firestore commit hiba ({r.status_code}): {r.text[:300]}')
+
+    def _delete_write(self, path):
+        return {'delete': f'{self.doc_root}/{path}'}
+
+    def _update_write(self, path, fields, mask=None):
+        write = {'update': {'name': f'{self.doc_root}/{path}', 'fields': _fields(fields)}}
+        if mask is not None:
+            write['updateMask'] = {'fieldPaths': mask}
+        return write
 
     # --- titkosítás ---
 
@@ -167,62 +225,63 @@ class FirebaseStore:
             })
         return records
 
-    def upsert_pending(self, company, entry):
-        """Upsert a dedup kulcs alapján; meglévő rekord státuszát nem írja felül."""
-        doc_id = entry_doc_id(entry)
-        path = f'companies/{company}/memory/{doc_id}'
-        existing = self._request('GET', path)
-        if existing is None:
-            self._request('PATCH', path, json_body={'fields': _fields({
-                'payload': self._encrypt_entry(entry),
-                'status': 'pending',
-                'consumed_in': None,
-                'created_at': _now_iso(),
-                'updated_at': _now_iso(),
-            })})
-        else:
-            self._request('PATCH', path,
-                          params={'updateMask.fieldPaths': ['payload', 'updated_at']},
-                          json_body={'fields': _fields({
-                              'payload': self._encrypt_entry(entry),
-                              'updated_at': _now_iso(),
-                          })})
+    def sync_processing(self, company, upsert_entries, consume_ids, ym, filename):
+        """Egy feldolgozás utáni összes írás (új/frissített várakozó rekordok,
+        felhasznált rekordok jelölése, előzmény-bejegyzés) egyetlen kötegelt
+        Firestore-kérésben. Korábban ez rekordonként külön GET+PATCH hívás volt."""
+        upsert_paths = [f'companies/{company}/memory/{entry_doc_id(e)}' for e in upsert_entries]
+        existing = self._batch_get(upsert_paths)
 
-    def mark_consumed(self, company, doc_id, ym):
-        self._request(
-            'PATCH', f'companies/{company}/memory/{doc_id}',
-            params={'updateMask.fieldPaths': ['status', 'consumed_in', 'updated_at']},
-            json_body={'fields': _fields({
-                'status': 'consumed',
-                'consumed_in': ym,
-                'updated_at': _now_iso(),
-            })})
+        writes = []
+        for entry, path in zip(upsert_entries, upsert_paths):
+            if path in existing:
+                writes.append(self._update_write(
+                    path, {'payload': self._encrypt_entry(entry), 'updated_at': _now_iso()},
+                    mask=['payload', 'updated_at']))
+            else:
+                writes.append(self._update_write(path, {
+                    'payload': self._encrypt_entry(entry), 'status': 'pending',
+                    'consumed_in': None, 'created_at': _now_iso(), 'updated_at': _now_iso(),
+                }))
+
+        for doc_id in consume_ids:
+            writes.append(self._update_write(
+                f'companies/{company}/memory/{doc_id}',
+                {'status': 'consumed', 'consumed_in': ym, 'updated_at': _now_iso()},
+                mask=['status', 'consumed_in', 'updated_at']))
+
+        history_id = uuid.uuid4().hex[:24]
+        writes.append(self._update_write(
+            f'companies/{company}/history/{history_id}',
+            {'filename': filename, 'year_month': ym, 'processed_at': _now_iso()}))
+
+        self._commit(writes)
 
     def delete_record(self, company, doc_id):
         self._request('DELETE', f'companies/{company}/memory/{doc_id}')
 
+    def delete_all_memory(self, company):
+        """A cég teljes várakozási sorának végleges törlése (egy kötegelt kérésben)."""
+        docs = self._list(f'companies/{company}/memory')
+        self._commit([self._delete_write(f'companies/{company}/memory/{d["_id"]}') for d in docs])
+
+    def delete_all_history(self, company):
+        """A cég teljes előzmény-listájának végleges törlése (egy kötegelt kérésben)."""
+        docs = self._list(f'companies/{company}/history')
+        self._commit([self._delete_write(f'companies/{company}/history/{d["_id"]}') for d in docs])
+
     def cleanup_expired(self, company):
         """A megőrzési időn túli (RETENTION_MONTHS-nál régebben consumed)
-        rekordok végleges törlése. Visszaadja a törölt rekordok számát."""
+        rekordok végleges törlése, egy kötegelt kérésben. Visszaadja a törölt
+        rekordok számát."""
         today = ym_today()
-        deleted = 0
-        for doc in self._list(f'companies/{company}/memory'):
-            if doc.get('status') != 'consumed' or not doc.get('consumed_in'):
-                continue
-            if months_between(doc['consumed_in'], today) > RETENTION_MONTHS:
-                self.delete_record(company, doc['_id'])
-                deleted += 1
-        return deleted
+        expired = [doc['_id'] for doc in self._list(f'companies/{company}/memory')
+                  if doc.get('status') == 'consumed' and doc.get('consumed_in')
+                  and months_between(doc['consumed_in'], today) > RETENTION_MONTHS]
+        self._commit([self._delete_write(f'companies/{company}/memory/{doc_id}') for doc_id in expired])
+        return len(expired)
 
     # --- előzmények ---
-
-    def add_history(self, company, filename, ym):
-        self._request('POST', f'companies/{company}/history',
-                      json_body={'fields': _fields({
-                          'filename': filename,
-                          'year_month': ym,
-                          'processed_at': _now_iso(),
-                      })})
 
     def load_history(self, company):
         return self._list(f'companies/{company}/history')

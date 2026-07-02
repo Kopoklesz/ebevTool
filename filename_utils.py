@@ -75,3 +75,10 @@ def set_local_alias(token, company):
     aliases[token] = company
     with open(_local_alias_path(), 'w', encoding='utf-8') as f:
         json.dump(aliases, f, ensure_ascii=False, indent=2)
+
+
+def reset_local_aliases():
+    """A helyi alias-cache (aliases.json) végleges törlése."""
+    path = _local_alias_path()
+    if os.path.exists(path):
+        os.remove(path)
