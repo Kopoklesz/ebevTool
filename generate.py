@@ -1,39 +1,24 @@
-import sys
-import os
-import json
-
-# Windows: ékezetes argumentumok helyes kezelése Win32 API-val
-if sys.platform == 'win32':
-    import ctypes
-    ctypes.windll.kernel32.SetConsoleCP(65001)
-    ctypes.windll.kernel32.SetConsoleOutputCP(65001)
-    try:
-        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
-    except Exception:
-        pass
-    try:
-        GetCommandLineW = ctypes.windll.kernel32.GetCommandLineW
-        GetCommandLineW.restype = ctypes.c_wchar_p
-        CommandLineToArgvW = ctypes.windll.shell32.CommandLineToArgvW
-        CommandLineToArgvW.restype = ctypes.POINTER(ctypes.c_wchar_p)
-        nargs = ctypes.c_int()
-        lp = CommandLineToArgvW(GetCommandLineW(), ctypes.byref(nargs))
-        unicode_args = [lp[i] for i in range(nargs.value)]
-        if getattr(sys, 'frozen', False):
-            sys.argv = unicode_args
-        elif len(unicode_args) >= 3:
-            sys.argv = [unicode_args[1]] + unicode_args[2:]
-    except Exception:
-        pass
-
 from datetime import datetime, timedelta
-from openpyxl import Workbook
+
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import PatternFill, Font
 from openpyxl.utils import get_column_letter
-import openpyxl
 
 EPOCH = datetime(1899, 12, 30)
+
+# Pozíció alapú oszlopkiosztás a bemeneti 'e-bev' lapon
+COL_NEV = 0
+COL_ADOAZON = 1
+COL_BEJELENTES = 2
+COL_TORLES = 3
+COL_KEZDES = 5
+COL_MUNKANAPOK = 7
+COL_TAJ = 8
+COL_HIBA = 9
+USED_COLUMNS = (COL_NEV, COL_ADOAZON, COL_BEJELENTES, COL_TORLES,
+                COL_KEZDES, COL_MUNKANAPOK, COL_TAJ, COL_HIBA)
+MIN_COLUMNS = max(USED_COLUMNS) + 1
+
 
 def date_str_to_serial(date_str):
     cleaned = str(date_str).rstrip('.').strip()
@@ -46,12 +31,33 @@ def date_str_to_serial(date_str):
     except Exception:
         return None
 
+
 def serial_to_date(serial):
     return EPOCH + timedelta(days=serial)
+
 
 def serial_to_month_serial(serial):
     dt = serial_to_date(serial)
     return (datetime(dt.year, dt.month, 1) - EPOCH).days
+
+
+def serial_to_ym(serial):
+    dt = serial_to_date(serial)
+    return f"{dt.year:04d}-{dt.month:02d}"
+
+
+def serial_to_iso(serial):
+    return serial_to_date(serial).strftime('%Y-%m-%d')
+
+
+def iso_to_serial(iso):
+    return (datetime.fromisoformat(iso) - EPOCH).days
+
+
+def entry_key(entry):
+    """Dedup kulcs: adóazonosító|kezdés dátuma (év-hó-nap)|munkanapok."""
+    return f"{entry['adoazonosito']}|{serial_to_iso(entry['start_serial'])}|{entry['munkanapok']}"
+
 
 def autofit(ws):
     DATE_FMT = 'YYYY.MM.DD.'
@@ -70,137 +76,113 @@ def autofit(ws):
                 max_len = length
         ws.column_dimensions[col_letter].width = max(max_len + 2, 8)
 
+
 def is_torles(row):
-    return str(row[3]).strip() == 'Törlés'
+    return len(row) > COL_TORLES and str(row[COL_TORLES]).strip() == 'Törlés'
+
 
 def is_hibas(row):
-    s = str(row[9]).strip().lower()
+    if len(row) <= COL_HIBA:
+        return False
+    s = str(row[COL_HIBA]).strip().lower()
     return s in ('hibás', 'hiba')
 
-def get_memory_path():
-    if getattr(sys, 'frozen', False):
-        base = os.path.dirname(sys.executable)
-    else:
-        base = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base, 'memory.json')
 
-def load_memory():
-    path = get_memory_path()
-    if os.path.exists(path):
-        with open(path, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return {}
-
-def save_memory(memory):
-    path = get_memory_path()
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(memory, f, ensure_ascii=False, indent=2)
-
-def main():
-    if len(sys.argv) < 2:
-        input("Húzd rá az Excel fájlt erre a programra!\nNyomj Entert a kilépéshez...")
-        return
-
-    input_file = sys.argv[1]
-    if not os.path.exists(input_file):
-        try:
-            input_file = input_file.encode('latin-1').decode('utf-8')
-        except Exception:
-            pass
-    if not os.path.exists(input_file):
-        input(f"Nem található a fájl: {input_file}\nNyomj Entert a kilépéshez...")
-        return
-
-    print(f"Beolvasás: {input_file}")
-
-    wb_in = openpyxl.load_workbook(input_file)
+def read_input(input_path):
+    """Beolvassa a bemeneti fájlt, visszaadja a fejlécet és az adatsorokat."""
+    wb_in = load_workbook(input_path)
     if 'e-bev' in wb_in.sheetnames:
         ws_in = wb_in['e-bev']
     else:
         ws_in = wb_in.active
     all_rows = list(ws_in.values)
-
     if not all_rows:
-        input("Üres fájl!\nNyomj Entert a kilépéshez...")
-        return
-
+        return None, []
     header = all_rows[0]
     data_rows = [r for r in all_rows[1:] if r[0] and str(r[0]).strip()]
+    return header, data_rows
+
+
+def check_header(header):
+    """Fejléc sanity-check: a lista elemei az észlelt problémák (üres = rendben)."""
+    if header is None:
+        return ['A fejléc sor hiányzik (üres fájl).']
+    problems = []
+    if len(header) < MIN_COLUMNS:
+        problems.append(
+            f'A fejléc csak {len(header)} oszlopot tartalmaz, legalább {MIN_COLUMNS} szükséges.')
+    for idx in USED_COLUMNS:
+        if idx < len(header):
+            val = header[idx]
+            if val is None or not str(val).strip():
+                problems.append(f'A fejléc {idx + 1}. oszlopa üres.')
+    return problems
+
+
+def extract_entries(data_rows):
+    """A sorokból kinyeri a rekordokat.
+
+    Visszatérés: (current_month_serial, current_entries, future_entries)
+    - current_entries: a fájl hónapjába (vagy korábbra) eső kezdések
+    - future_entries: jövőbeli hónapban kezdődők (várakozási sorba kerülnek)
+    Az aktuális hónapot a bejelentési dátumok leggyakoribb hónapja adja.
+    """
     active_rows = [r for r in data_rows if not is_torles(r) and not is_hibas(r)]
 
-    # Az aktuális fájl hónapját a bejelentés napjaiból határozzuk meg (a leggyakoribb hónap)
     bejelentes_months = {}
     for r in active_rows:
-        s = date_str_to_serial(str(r[2]).split(' ')[0]) if r[2] else None
+        s = date_str_to_serial(str(r[COL_BEJELENTES]).split(' ')[0]) if r[COL_BEJELENTES] else None
         if s:
             ms = serial_to_month_serial(s)
             bejelentes_months[ms] = bejelentes_months.get(ms, 0) + 1
     current_month_serial = max(bejelentes_months, key=bejelentes_months.get) if bejelentes_months else None
 
-    # Memory betöltése (előző hónapból áthúzódó rekordok)
-    memory = load_memory()
-
-    # Az aktuális fájl rekordjait feldolgozzuk:
-    # - ha Kezdés napja az aktuális hónapban (vagy korábban) van → ebbe a statisztikába kerül
-    # - ha Kezdés napja egy JÖVŐBELI hónapban van → mentjük a memóriába a következő hónapnak
-    current_entries = []   # az aktuális statisztikába kerülők
-    new_memory = {}        # amit a memóriában tartunk a következő hónapnak
-
+    current_entries = []
+    future_entries = []
     for r in active_rows:
-        nev = str(r[0]).strip()
-        adoazon = str(r[1]).strip()
-        taj = str(r[8]).strip()
         try:
-            munkanapok = int(r[7])
+            munkanapok = int(r[COL_MUNKANAPOK])
         except Exception:
             munkanapok = 1
-        start_serial = date_str_to_serial(r[5])
+        start_serial = date_str_to_serial(r[COL_KEZDES])
         if start_serial is None:
             continue
-
-        start_month = serial_to_month_serial(start_serial)
-        key = f"{adoazon}|{start_serial}|{munkanapok}"
-
-        if current_month_serial and start_month > current_month_serial:
-            # Jövőbeli kezdés → mentjük a következő hónapnak
-            new_memory[key] = {
-                'nev': nev, 'adoazonosito': adoazon, 'taj': taj,
-                'start_serial': start_serial, 'munkanapok': munkanapok
-            }
+        entry = {
+            'nev': str(r[COL_NEV]).strip(),
+            'adoazonosito': str(r[COL_ADOAZON]).strip(),
+            'taj': str(r[COL_TAJ]).strip(),
+            'start_serial': start_serial,
+            'munkanapok': munkanapok,
+        }
+        if current_month_serial and serial_to_month_serial(start_serial) > current_month_serial:
+            future_entries.append(entry)
         else:
-            # Aktuális vagy múltbeli kezdés → ebbe a statisztikába kerül
-            current_entries.append({
-                'nev': nev, 'adoazonosito': adoazon, 'taj': taj,
-                'start_serial': start_serial, 'munkanapok': munkanapok
-            })
-
-    # A memóriából áthozott rekordok (előző hónapban bejelentve, most kezdenek)
-    carried_count = 0
-    for key, entry in memory.items():
-        start_month = serial_to_month_serial(entry['start_serial'])
-        if current_month_serial is None or start_month <= current_month_serial:
-            # Ez a hónap már itt van → bekerül a statisztikába
             current_entries.append(entry)
-            carried_count += 1
-        else:
-            # Még nem aktuális → marad a memóriában
-            new_memory[key] = entry
 
-    save_memory(new_memory)
-    print(f"Áthozott rekord az előző hónapból: {carried_count}, következő hónapra mentve: {len(new_memory)}")
+    return current_month_serial, current_entries, future_entries
 
-    # Struktúra felépítése
+
+def merge_entries(current_entries, carried_entries):
+    """A fájlból jövő és az áthozott rekordok egyesítése, dedup kulcs szerint."""
+    merged = list(current_entries)
+    seen = {entry_key(e) for e in current_entries}
+    for e in carried_entries:
+        if entry_key(e) not in seen:
+            seen.add(entry_key(e))
+            merged.append(e)
+    return merged
+
+
+def generate_output(input_path, header, data_rows, entries, output_path=None):
+    """Legenerálja a statisztika munkafüzetet, visszaadja a kimeneti útvonalat."""
     by_date = {}
     by_name = {}
 
-    for entry in current_entries:
+    for entry in entries:
         nev = entry['nev']
-        adoazon = entry['adoazonosito']
-        taj = entry['taj']
-
         if nev not in by_name:
-            by_name[nev] = {'adoazonosito': adoazon, 'taj': taj, 'dates': set()}
-
+            by_name[nev] = {'adoazonosito': entry['adoazonosito'],
+                            'taj': entry['taj'], 'dates': set()}
         for i in range(entry['munkanapok']):
             serial = entry['start_serial'] + i
             by_date.setdefault(serial, []).append({'nev': nev})
@@ -213,7 +195,7 @@ def main():
     wb_out = Workbook()
     wb_out.remove(wb_out.active)
 
-    RED_FILL  = PatternFill("solid", fgColor="FF0000")
+    RED_FILL = PatternFill("solid", fgColor="FF0000")
     BLUE_FILL = PatternFill("solid", fgColor="4472C4")
     WHITE_FONT = Font(color="FFFFFF", bold=True)
 
@@ -298,12 +280,8 @@ def main():
     for ws in wb_out.worksheets:
         autofit(ws)
 
-    base = os.path.splitext(input_file)[0]
-    output_file = base + '_statisztika.xlsx'
-    wb_out.save(output_file)
-    print(f"Kész! Kimenet: {output_file}")
-    if sys.stdin.isatty():
-        input("Nyomj Entert a kilépéshez...")
-
-if __name__ == '__main__':
-    main()
+    if output_path is None:
+        import os
+        output_path = os.path.splitext(input_path)[0] + '_statisztika.xlsx'
+    wb_out.save(output_path)
+    return output_path
