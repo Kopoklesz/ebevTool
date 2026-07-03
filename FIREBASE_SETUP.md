@@ -1,8 +1,5 @@
 # Firebase beállítás — egyszeri, kézi lépések
 
-Ez az útmutató a projekt gazdájának szól: ezeket a lépéseket **egyszer**,
-a build előtt kell elvégezni a [Firebase console](https://console.firebase.google.com/)-on.
-
 ## 1. Firebase projekt létrehozása
 
 1. Nyisd meg a Firebase console-t, jelentkezz be Google-fiókkal.
@@ -46,32 +43,18 @@ az app által használt útvonalakhoz — minden más útvonal zárva marad.
 
 1. Fogaskerék ikon → **Project settings** → **General** fül.
 2. Másold ki a **Web API Key** és a **Project ID** értékét.
-3. A repóban másold le a `config.example.py`-t `config.py` néven, és írd be a
-   két értéket.
-4. Generálj egy Fernet titkosítási kulcsot, és azt is írd be a `config.py`-ba:
+3. Generálj egy Fernet titkosítási kulcsot:
    ```
    python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
    ```
    **Fontos:** ezt a kulcsot őrizd meg biztonságos helyen — ha elveszik, a
    Firestore-ban tárolt (titkosított) rekordok visszafejthetetlenné válnak.
+4. A három értéket (Web API Key, Project ID, Fernet kulcs) az alkalmazás
+   futtatásakor az oldalsáv **⚙ Beállítások** ablakában add meg (az ablakban
+   egy **❓ Hogyan találom meg ezeket az adatokat?** gomb is elérhető, ami
+   ugyanezt a lépéssort mutatja, laikusabban megfogalmazva).
 
 A Web API key a Firebase dokumentáció szerint nem titok (a security rules és a
-kliensoldali titkosítás védi az adatokat), de a `config.py` így sem kerül
-verziókezelésbe.
-
-## Terjesztési modell
-
-- A fenti beállítás és a `config.py` kitöltése után az alkalmazás önálló
-  `.exe`-vé fordítható (PyInstaller, lásd README.md) — a konfiguráció
-  belefordul a binárisba.
-- Aki megkapja és futtatja az `.exe`-t: **nem kell semmilyen Firebase-fiókot
-  regisztrálnia vagy beállítania**, nem kell adatbázissal bajlódnia. A program
-  a háttérben, automatikusan (anonim bejelentkezéssel) kommunikál a
-  Firestore-ral. A munkafolyamat a megszokott: futtatja az `.exe`-t, behúzza
-  vagy betallózza az Excel fájlt, igény esetén megnézi az Előzmények /
-  Várakozási sor nézeteket.
-- Mivel mindenki ugyanazt a Firestore-adatbázist éri el, több gépen vagy
-  felhasználónál futtatva is közösen látható és konzisztens az Előzmények és a
-  Várakozási sor.
-- Minden az ingyenes **Spark csomagon** belül marad (Firestore + Anonymous
-  Auth ingyenes kvótával; a havi néhány feldolgozás messze belefér).
+kliensoldali titkosítás védi az adatokat), a Fernet kulcs viszont igen — ezt
+soha ne oszd meg, és ne is kelljen: a Beállítások ablak sosem tárolja
+olvasható formában (lásd lent).

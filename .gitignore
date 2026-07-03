@@ -1,6 +1,7 @@
 *.exe
 *.xlsx
 config.py
+config.dat
 aliases.json
 archívum/
 build/

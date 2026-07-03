@@ -1,10 +1,11 @@
+import json
 import os
 import shutil
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
-# Windows: ékezetes argumentumok helyes kezelése Win32 API-val
 if sys.platform == 'win32':
     import ctypes
     try:
@@ -31,14 +32,87 @@ try:
 except ImportError:
     DND_AVAILABLE = False
 
+from cryptography.fernet import Fernet
+import webbrowser
+
 import generate
 import filename_utils
+import dpapi_crypto
+from dpapi_crypto import DPAPIError
 from firebase_store import FirebaseError, FirebaseStore, months_between, ym_today
 
-try:
-    import config
-except ImportError:
-    config = None
+CONFIG_FIELDS = ('FIREBASE_API_KEY', 'FIREBASE_PROJECT_ID', 'FERNET_KEY', 'ARCHIVE_DIR')
+
+
+def config_path():
+    return os.path.join(filename_utils.app_dir(), 'config.dat')
+
+
+def _legacy_config_py_path():
+    return os.path.join(filename_utils.app_dir(), 'config.py')
+
+
+def _load_legacy_plaintext_config():
+    path = _legacy_config_py_path()
+    if not os.path.exists(path):
+        return None
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('ebevtool_legacy_config', path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return {k: getattr(module, k, None) for k in CONFIG_FIELDS}
+    except Exception:
+        return None
+
+
+def save_runtime_config(data: dict):
+    raw = json.dumps(data, ensure_ascii=False).encode('utf-8')
+    encrypted = dpapi_crypto.protect(raw)
+    with open(config_path(), 'wb') as f:
+        f.write(encrypted)
+
+
+def load_runtime_config():
+    path = config_path()
+    if os.path.exists(path):
+        try:
+            with open(path, 'rb') as f:
+                encrypted = f.read()
+            raw = dpapi_crypto.unprotect(encrypted)
+            data = json.loads(raw.decode('utf-8'))
+            return SimpleNamespace(**{k: data.get(k) for k in CONFIG_FIELDS})
+        except Exception:
+            return None
+
+    legacy = _load_legacy_plaintext_config()
+    if legacy is not None:
+        try:
+            save_runtime_config(legacy)
+            os.remove(_legacy_config_py_path())
+        except Exception:
+            pass
+        return SimpleNamespace(**legacy)
+
+    return None
+
+
+config = load_runtime_config()
+
+
+FIRESTORE_RULES = """rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /companies/{company}/{document=**} {
+      allow read, write: if request.auth != null;
+    }
+    match /company_aliases/{token} {
+      allow read, write: if request.auth != null;
+    }
+  }
+}"""
+
+FIREBASE_CONSOLE_URL = 'https://console.firebase.google.com/'
 
 
 def default_archive_dir():
@@ -161,10 +235,7 @@ class App:
         self.history_state = {}
         self.queue_state = {'trees': {}, 'companies': []}
 
-        if config is not None:
-            self.store = FirebaseStore(config.FIREBASE_API_KEY,
-                                       config.FIREBASE_PROJECT_ID,
-                                       config.FERNET_KEY)
+        self._init_store()
 
         root.title('ebevTool – Statisztika generálás')
         root.geometry('1040x660')
@@ -174,13 +245,23 @@ class App:
         self._build_layout()
 
         if not DND_AVAILABLE:
-            self.log('Figyelem: a tkinterdnd2 csomag nem elérhető, a drag&drop '
-                     'nem működik — használd a Tallózás gombot. (pip install tkinterdnd2)')
+            self.log('Figyelem: a drag&drop '
+                     'nem működik — használd a Tallózás gombot.')
         if config is None:
-            self.log('Figyelem: nincs config.py — a Firebase funkciók (várakozási '
-                     'sor, előzmények, aliasok) nem érhetők el. Másold le a '
-                     'config.example.py-t config.py néven és töltsd ki '
-                     '(lásd FIREBASE_SETUP.md).')
+            self.log('Figyelem: nincsenek elmentve Firebase-adatok — a Firebase '
+                     'funkciók nem érhetők '
+                     'el. Töltsd ki az oldalsávon a ⚙ Beállítások ablakot.')
+
+    def _init_store(self):
+        global config
+        config = load_runtime_config()
+        self._online = None
+        if config is not None:
+            self.store = FirebaseStore(config.FIREBASE_API_KEY,
+                                       config.FIREBASE_PROJECT_ID,
+                                       config.FERNET_KEY)
+        else:
+            self.store = None
 
     # --- elrendezés ---
 
@@ -206,8 +287,13 @@ class App:
 
         ttk.Frame(sidebar, style='Sidebar.TFrame').pack(fill='both', expand=True)
 
+        settings_btn = ttk.Button(sidebar, text='⚙  Beállítások', style='Nav.TButton',
+                                  command=self.open_settings)
+        settings_btn.pack(fill='x', padx=10, pady=(0, 2))
+        self._busy_widgets.append(settings_btn)
+
         sep = tk.Frame(sidebar, bg=COLORS['sidebar_hover'], height=1)
-        sep.pack(fill='x', padx=18, pady=(0, 8))
+        sep.pack(fill='x', padx=18, pady=(8, 8))
         reset_btn = ttk.Button(sidebar, text='🗑  Reset', style='Danger.TButton',
                                command=self.confirm_reset)
         reset_btn.pack(fill='x', padx=10, pady=(0, 18))
@@ -256,7 +342,7 @@ class App:
         header.grid(row=0, column=0, sticky='ew', padx=24, pady=(18, 12))
         ttk.Label(header, text='Excel feldolgozás', style='Heading.TLabel').pack(anchor='w')
         ttk.Label(header, text='Húzd ide a fájlt, vagy tallózd be — a rendszer felismeri a '
-                               'céget és elkészíti a statisztikát.',
+                               'céget és elkészíti a sablont.',
                   style='Muted.TLabel').pack(anchor='w', pady=(2, 0))
 
         path_row = ttk.Frame(page)
@@ -325,7 +411,6 @@ class App:
         self._loading_text = text
         self._loading_active = True
         self.loading_overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
-        # tk.Canvas felülírja a .lift()-et (tag_raise-re), ezért közvetlen Tk hívással emeljük ki
         self.loading_overlay.tk.call('raise', self.loading_overlay._w)
         self._draw_loading_card()
         self._spin_tick()
@@ -345,8 +430,6 @@ class App:
                 x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
 
     def _draw_loading_card(self):
-        """A betöltő overlay statikus része: elhomályosított háttér + lebegő,
-        lekerekített kártya (a spinner ívét külön a _spin_tick rajzolja újra)."""
         c = self.loading_overlay
         if not self._loading_active:
             return
@@ -404,9 +487,6 @@ class App:
 
     @staticmethod
     def _parallel_map(items, fn, max_workers=8):
-        """items minden elemére lefuttatja fn-t párhuzamosan (külön szálakon),
-        {item: eredmény} alakban adja vissza. Cégenkénti Firestore-hívásokhoz,
-        hogy ne soros kör-utakban, hanem egyszerre fussanak."""
         if not items:
             return {}
         with ThreadPoolExecutor(max_workers=min(max_workers, len(items))) as ex:
@@ -423,7 +503,6 @@ class App:
         self.root.update_idletasks()
 
     def log_link(self, prefix, path):
-        """Naplósor, ahol a fájl/mappa útvonala kattintható link (megnyitja Intézőben)."""
         self.status.configure(state='normal')
         self.status.insert('end', prefix)
         start = self.status.index('end-1c')
@@ -449,7 +528,6 @@ class App:
             messagebox.showerror('Hiba', f'Nem sikerült megnyitni:\n{e}')
 
     def _try_sign_in(self):
-        """Szálbiztos bejelentkezés-ellenőrzés: nem nyúl UI-elemhez."""
         if not self.store:
             return False, None
         if self._online is not None:
@@ -463,7 +541,6 @@ class App:
             return False, e
 
     def store_online(self):
-        """Lazy bejelentkezés (fő szálról hívva); False, ha nincs config vagy kapcsolat."""
         online, err = self._try_sign_in()
         if err:
             self.log(f'Firebase nem érhető el: {err}')
@@ -491,9 +568,6 @@ class App:
     # --- cégfelismerés ---
 
     def known_companies(self):
-        """Korábban megismert cégek (helyi + Firestore aliasok alapján), rendezve.
-
-        Szálbiztos: nem nyúl UI-elemhez, ezért háttérszálról is hívható."""
         companies = set(filename_utils.load_local_aliases().values())
         online, _ = self._try_sign_in()
         if online:
@@ -504,8 +578,6 @@ class App:
         return sorted(c for c in companies if c)
 
     def ask_company_dialog(self, filename):
-        """Modális popup: korábban megismert cégek közül választás vagy új
-        cégnév megadása; None, ha bezárták."""
         result = {'company': None}
         dlg = tk.Toplevel(self.root)
         dlg.title('Cég kiválasztása')
@@ -581,8 +653,6 @@ class App:
             'Feldolgozás és mentés...')
 
     def _process_file_prepare(self, path):
-        """Fő szálon fut: fájlbeolvasás, cégfelismerés, megerősítő párbeszédek.
-        Visszaadja a háttérszálnak szükséges kontextust, vagy None-t megszakításkor."""
         self._online = None  # kapcsolat újrapróbálása minden futásnál
         if not os.path.exists(path):
             messagebox.showerror('Hiba', f'Nem található a fájl:\n{path}')
@@ -641,7 +711,6 @@ class App:
         }
 
     def _process_file_async(self, ctx):
-        """Háttérszálon fut: nem nyúl UI-elemhez, csak naplósorokat gyűjt."""
         logs = []
         online, err = self._try_sign_in()
         records = []
@@ -727,7 +796,7 @@ class App:
         page = self.pages['history']
         page.tkraise()
         if not self.store:
-            self._render_page_message(page, 'Nincs beállítva Firebase-kapcsolat (config.py hiányzik).')
+            self._render_page_message(page, 'Nincs beállítva Firebase-kapcsolat (töltsd ki a ⚙ Beállítások ablakot).')
             return
 
         def work():
@@ -775,7 +844,7 @@ class App:
         page = self.pages['queue']
         page.tkraise()
         if not self.store:
-            self._render_page_message(page, 'Nincs beállítva Firebase-kapcsolat (config.py hiányzik).')
+            self._render_page_message(page, 'Nincs beállítva Firebase-kapcsolat (töltsd ki a ⚙ Beállítások ablakot).')
             return
 
         def work():
@@ -877,9 +946,6 @@ class App:
         ttk.Label(wrap, text=text, style='Muted.TLabel', wraplength=420, justify='center').pack(pady=(8, 0))
 
     def _build_company_switcher(self, body, companies):
-        """Pill-gombsor a cégek közti váltáshoz — a natív Notebook fül helyett,
-        hogy a jóváhagyott oldalsáv-navigációval egységes, letisztultabb hangulatot adjon.
-        Visszaadja: (cégenkénti tartalom-frame dict, kijelölő függvény, {'active': ...} állapot)."""
         bar_wrap = tk.Frame(body, bg=COLORS['bg'])
         bar_wrap.pack(fill='x', pady=(0, 12))
         bar = ttk.Frame(bar_wrap)
@@ -925,6 +991,217 @@ class App:
         tree.tag_configure('odd', background=COLORS['row_alt'])
         tree.tag_configure('even', background=COLORS['card'])
         return tree
+
+    # --- Beállítások (titkosított config.dat szerkesztése) ---
+
+    def _write_config(self, api_key, project_id, fernet_key, archive_dir):
+        data = {
+            'FIREBASE_API_KEY': api_key,
+            'FIREBASE_PROJECT_ID': project_id,
+            'FERNET_KEY': fernet_key,
+            'ARCHIVE_DIR': archive_dir or None,
+        }
+        try:
+            save_runtime_config(data)
+        except DPAPIError as e:
+            raise RuntimeError(str(e)) from e
+
+    def open_setup_guide(self):
+        dlg = tk.Toplevel(self.root)
+        dlg.title('Útmutató — Firebase adatok beszerzése')
+        dlg.configure(bg=COLORS['card'])
+        dlg.grab_set()
+        dlg.geometry('620x560')
+        dlg.minsize(480, 360)
+
+        header = ttk.Frame(dlg, style='Card.TFrame')
+        header.pack(fill='x', padx=20, pady=(18, 6))
+        ttk.Label(header, text='🧭  Honnan szerezzem meg az adatokat?', background=COLORS['card'],
+                 font=FONT_HEAD).pack(anchor='w')
+        ttk.Label(header, text='Kövesd sorban a lépéseket — csak egy Google-fiók kell hozzá.',
+                 background=COLORS['card'], foreground=COLORS['muted'], font=FONT_BASE,
+                 wraplength=560, justify='left').pack(anchor='w', pady=(4, 0))
+
+        open_btn = ttk.Button(header, text='🔗  Firebase console megnyitása böngészőben',
+                              style='Accent.TButton',
+                              command=lambda: webbrowser.open(FIREBASE_CONSOLE_URL))
+        open_btn.pack(anchor='w', pady=(10, 0))
+
+        body = tk.Frame(dlg, bg=COLORS['card'])
+        body.pack(fill='both', expand=True, padx=20, pady=(10, 6))
+        text = tk.Text(body, wrap='word', bd=0, bg=COLORS['card'], fg=COLORS['text'],
+                       font=FONT_BASE, padx=4, pady=4, cursor='arrow')
+        scroll = ttk.Scrollbar(body, command=text.yview)
+        text.configure(yscrollcommand=scroll.set)
+        text.pack(side='left', fill='both', expand=True)
+        scroll.pack(side='right', fill='y')
+
+        text.tag_configure('h', font=FONT_BOLD, foreground=COLORS['accent'], spacing1=14, spacing3=4)
+        text.tag_configure('body', font=FONT_BASE, spacing3=2)
+        text.tag_configure('code', font=('Consolas', 9), background=COLORS['row_alt'],
+                           lmargin1=16, lmargin2=16, spacing1=4, spacing3=8)
+
+        def h(t):
+            text.insert('end', t + '\n', 'h')
+
+        def p(t):
+            text.insert('end', t + '\n', 'body')
+
+        def code(t):
+            text.insert('end', t + '\n', 'code')
+
+        h('1. lépés — Firebase projekt létrehozása')
+        p('• Nyisd meg a fenti gombbal a Firebase console-t, és jelentkezz be a Google-fiókoddal.')
+        p('• Kattints az "Add project" / "Projekt hozzáadása" gombra.')
+        p('• Adj neki egy tetszőleges nevet (pl. "ebevtool"), majd Tovább.')
+        p('• A Google Analytics kérdésnél nyugodtan kapcsold ki, nincs rá szükség.')
+        p('• Kattints a "Create project" / "Projekt létrehozása" gombra, és várd meg, míg elkészül.')
+
+        h('2. lépés — Adatbázis (Firestore) létrehozása')
+        p('• A bal oldali menüben: Build → Firestore Database.')
+        p('• Kattints a "Create database" gombra.')
+        p('• Módnak válaszd a "Native mode" / "Alapértelmezett mód" opciót.')
+        p('• Régiónak válassz egy európai régiót, pl. europe-west3 (Frankfurt).')
+        p('• A kezdő biztonsági szabályok nem számítanak, a következő lépésben úgyis felülírjuk.')
+
+        h('3. lépés — Bejelentkezés engedélyezése az alkalmazásnak')
+        p('• Bal oldali menü: Build → Authentication → "Get started".')
+        p('• A "Sign-in method" fülön válaszd az "Anonymous" lehetőséget, kapcsold be, majd mentsd el.')
+        p('• Ez teszi lehetővé, hogy az alkalmazás automatikusan, jelszó nélkül tudjon kapcsolódni.')
+
+        h('4. lépés — Biztonsági szabályok beillesztése')
+        p('• A Firestore Database oldalon kattints a "Rules" fülre.')
+        p('• Töröld ki a meglévő szöveget, és illeszd be helyette az alábbit:')
+        code(FIRESTORE_RULES)
+        p('• Kattints a "Publish" gombra a mentéshez.')
+        p('• Ez azt jelenti: csak az alkalmazáson keresztül, bejelentkezve lehet hozzáférni az '
+          'adatokhoz — más nem éri el őket.')
+
+        h('5. lépés — A három adat kimásolása')
+        p('• Kattints a bal felső fogaskerék ikonra, majd a "Project settings" menüpontra.')
+        p('• A "General" fülön találod:')
+        p('    – Project ID  →  ezt írd be a Beállítások ablak "Firebase Project ID" mezőjébe')
+        p('    – Web API Key  →  ezt írd be a "Firebase Web API Key" mezőbe')
+        p('• A Fernet titkosítási kulcsot nem kell máshonnan másolni (kivétel, ha nem akarsz csatlakozni egy már létező adatbázishoz): a Beállítások ablakban az '
+          '"Új kulcs generálása" gombbal egy kattintással létrehozható.')
+
+        h('6. lépés — Mentés')
+        p('• Zárd be ezt az ablakot, töltsd ki mindhárom mezőt a Beállítások ablakban, majd '
+          'kattints a "Mentés" gombra.')
+        p('• Ezzel kész is — az alkalmazás mostantól tudja használni az Előzmények és a '
+          'Várakozási sor funkciókat.')
+
+        text.configure(state='disabled')
+
+        ttk.Button(dlg, text='Bezárás', style='Secondary.TButton', command=dlg.destroy).pack(pady=(0, 16))
+        dlg.bind('<Escape>', lambda e: dlg.destroy())
+
+    def open_settings(self):
+        dlg = tk.Toplevel(self.root)
+        dlg.title('Beállítások')
+        dlg.configure(bg=COLORS['card'])
+        dlg.grab_set()
+        dlg.resizable(False, False)
+
+        ttk.Label(dlg, text='⚙️', font=('Segoe UI', 26), background=COLORS['card']).pack(pady=(20, 4))
+        ttk.Label(dlg, text='Adatbázis-kapcsolat beállítása', background=COLORS['card'],
+                 font=FONT_BOLD).pack(padx=24)
+        ttk.Label(dlg, text='Ezek az adatok titkosítva, csak ezen a Windows-fiókban és gépen tárolódnak'
+                          ' az adatbázisba feltöltött adatokat csak az tudja olvasni, akivel megegyezik az összes adat.'
+                          ' Ha a Fernet kulcsot elhagyod, csak a teljes reset segíthet.',
+                 background=COLORS['card'], foreground=COLORS['muted'], justify='center',
+                 wraplength=380, font=FONT_BASE).pack(padx=24, pady=(4, 8))
+        ttk.Button(dlg, text='❓  Hogyan találom meg ezeket az adatokat?', style='Secondary.TButton',
+                  command=self.open_setup_guide).pack(padx=24, pady=(0, 12))
+
+        form = ttk.Frame(dlg, style='Card.TFrame')
+        form.pack(padx=24, fill='x')
+        form.grid_columnconfigure(1, weight=1)
+
+        api_key_var = tk.StringVar(value=getattr(config, 'FIREBASE_API_KEY', '') if config else '')
+        project_id_var = tk.StringVar(value=getattr(config, 'FIREBASE_PROJECT_ID', '') if config else '')
+        fernet_var = tk.StringVar(value=getattr(config, 'FERNET_KEY', '') if config else '')
+        archive_var = tk.StringVar(value=getattr(config, 'ARCHIVE_DIR', None) or '' if config else '')
+
+        def add_row(r, label):
+            ttk.Label(form, text=label, background=COLORS['card'], font=FONT_BASE).grid(
+                row=r, column=0, sticky='w', pady=(0, 8), padx=(0, 10))
+
+        add_row(0, 'Firebase Web API Key:')
+        ttk.Entry(form, textvariable=api_key_var, width=38).grid(row=0, column=1, sticky='ew', pady=(0, 8))
+
+        add_row(1, 'Firebase Project ID:')
+        ttk.Entry(form, textvariable=project_id_var, width=38).grid(row=1, column=1, sticky='ew', pady=(0, 8))
+
+        add_row(2, 'Fernet titkosítási kulcs:')
+        fernet_entry = ttk.Entry(form, textvariable=fernet_var, width=38, show='•')
+        fernet_entry.grid(row=2, column=1, sticky='ew', pady=(0, 8))
+
+        fernet_btns = ttk.Frame(form, style='Card.TFrame')
+        fernet_btns.grid(row=3, column=1, sticky='w', pady=(0, 14))
+
+        def toggle_fernet_visible():
+            visible = fernet_entry.cget('show') == ''
+            fernet_entry.configure(show='•' if visible else '')
+            show_btn.configure(text='👁  Mutat' if visible else '🙈  Elrejt')
+
+        show_btn = ttk.Button(fernet_btns, text='👁  Mutat', style='Secondary.TButton',
+                              command=toggle_fernet_visible)
+        show_btn.pack(side='left', padx=(0, 6))
+
+        def gen_fernet():
+            fernet_var.set(Fernet.generate_key().decode())
+
+        ttk.Button(fernet_btns, text='Új kulcs generálása', style='Secondary.TButton',
+                  command=gen_fernet).pack(side='left')
+
+        add_row(4, 'Archívum mappa (opcionális):')
+        ttk.Entry(form, textvariable=archive_var, width=38).grid(row=4, column=1, sticky='ew', pady=(0, 8))
+
+        def browse_archive():
+            path = filedialog.askdirectory(title='Archívum mappa kiválasztása')
+            if path:
+                archive_var.set(path)
+
+        ttk.Button(form, text='Tallózás...', style='Secondary.TButton',
+                  command=browse_archive).grid(row=5, column=1, sticky='w', pady=(0, 10))
+
+        status_lbl = ttk.Label(dlg, text='', background=COLORS['card'], foreground=COLORS['danger'],
+                               font=FONT_BASE, wraplength=380, justify='center')
+        status_lbl.pack(padx=24)
+
+        def do_save():
+            api_key = api_key_var.get().strip()
+            project_id = project_id_var.get().strip()
+            fernet_key = fernet_var.get().strip()
+            archive_dir = archive_var.get().strip()
+
+            if not api_key or not project_id or not fernet_key:
+                status_lbl.configure(text='A Web API Key, a Project ID és a Fernet kulcs kitöltése kötelező.')
+                return
+            try:
+                Fernet(fernet_key.encode('ascii'))
+            except Exception:
+                status_lbl.configure(text='Érvénytelen Fernet kulcs — használd a generálás gombot, '
+                                          'vagy másold be a korábban mentett kulcsot.')
+                return
+
+            try:
+                self._write_config(api_key, project_id, fernet_key, archive_dir or None)
+            except Exception as e:
+                status_lbl.configure(text=f'A mentés nem sikerült: {e}')
+                return
+
+            self._init_store()
+            dlg.destroy()
+            self.log('Beállítások elmentve és betöltve (titkosítva, config.dat).')
+            messagebox.showinfo('Kész', 'A beállítások elmentve, a kapcsolat azonnal életbe lép.')
+
+        btns = ttk.Frame(dlg, style='Card.TFrame')
+        btns.pack(pady=(6, 20))
+        ttk.Button(btns, text='Mégse', style='Secondary.TButton', command=dlg.destroy).pack(side='left', padx=6)
+        ttk.Button(btns, text='Mentés', style='Accent.TButton', command=do_save).pack(side='left', padx=6)
+        dlg.bind('<Escape>', lambda e: dlg.destroy())
 
     # --- Reset ---
 
@@ -980,6 +1257,7 @@ class App:
         def wipe_company(c):
             self.store.delete_all_memory(c)
             self.store.delete_all_history(c)
+            self.store.delete_all_aliases(c)
 
         def work():
             online, err = self._try_sign_in()

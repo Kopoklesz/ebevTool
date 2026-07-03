@@ -12,7 +12,7 @@ IDENTITY_URL = 'https://identitytoolkit.googleapis.com/v1/accounts:signUp'
 FIRESTORE_BASE = 'https://firestore.googleapis.com/v1'
 TIMEOUT = 15
 
-# Consumed rekordok megőrzési ideje hónapban (fél év)
+# Consumed rekordok megőrzési ideje hónapban
 RETENTION_MONTHS = 6
 
 # Firestore commit végpontonkénti írás-limit
@@ -29,7 +29,6 @@ def ym_today():
 
 
 def months_between(ym_from, ym_to):
-    """Hónapok száma ym_from-tól ym_to-ig (pozitív, ha ym_to későbbi)."""
     y1, m1 = int(ym_from[:4]), int(ym_from[5:7])
     y2, m2 = int(ym_to[:4]), int(ym_to[5:7])
     return (y2 * 12 + m2) - (y1 * 12 + m1)
@@ -72,7 +71,6 @@ def _parse_doc(doc):
 
 
 def entry_doc_id(entry):
-    """Determinisztikus dokumentum-azonosító a dedup kulcsból (upsert-hez)."""
     return hashlib.sha256(entry_key(entry).encode('utf-8')).hexdigest()[:32]
 
 
@@ -83,15 +81,11 @@ class FirebaseStore:
         self.doc_root = f'projects/{project_id}/databases/(default)/documents'
         self.doc_base = f'{FIRESTORE_BASE}/{self.doc_root}'
         self.id_token = None
-        # Kapcsolat-újrahasznosítás (keep-alive): egy munkamenetben sok egymást
-        # követő Firestore hívás történik, session nélkül mindegyik új TCP/TLS
-        # kapcsolatot nyitna.
         self.session = requests.Session()
 
     # --- kapcsolat ---
 
     def sign_in(self):
-        """Anonim bejelentkezés; FirebaseError-t dob, ha nem sikerül."""
         if self.id_token:
             return
         try:
@@ -134,8 +128,6 @@ class FirebaseStore:
         return docs
 
     def _batch_get(self, paths):
-        """Több dokumentum egyetlen kéréssel; visszaadja a létező dokumentumokat
-        {relatív_path: doc} alakban (a hiányzók nem szerepelnek)."""
         if not paths:
             return {}
         self.sign_in()
@@ -158,7 +150,6 @@ class FirebaseStore:
         return found
 
     def _commit(self, writes):
-        """Több írás/törlés egy vagy több kötegelt (:commit) kérésben."""
         if not writes:
             return
         self.sign_in()
@@ -209,8 +200,6 @@ class FirebaseStore:
     # --- memória (várakozási sor) ---
 
     def load_memory(self, company):
-        """Az összes tárolt rekord dekódolva:
-        [{'id', 'status', 'consumed_in', 'entry': {...}}, ...]"""
         records = []
         for doc in self._list(f'companies/{company}/memory'):
             try:
@@ -226,9 +215,6 @@ class FirebaseStore:
         return records
 
     def sync_processing(self, company, upsert_entries, consume_ids, ym, filename):
-        """Egy feldolgozás utáni összes írás (új/frissített várakozó rekordok,
-        felhasznált rekordok jelölése, előzmény-bejegyzés) egyetlen kötegelt
-        Firestore-kérésben. Korábban ez rekordonként külön GET+PATCH hívás volt."""
         upsert_paths = [f'companies/{company}/memory/{entry_doc_id(e)}' for e in upsert_entries]
         existing = self._batch_get(upsert_paths)
 
@@ -261,19 +247,19 @@ class FirebaseStore:
         self._request('DELETE', f'companies/{company}/memory/{doc_id}')
 
     def delete_all_memory(self, company):
-        """A cég teljes várakozási sorának végleges törlése (egy kötegelt kérésben)."""
         docs = self._list(f'companies/{company}/memory')
         self._commit([self._delete_write(f'companies/{company}/memory/{d["_id"]}') for d in docs])
 
     def delete_all_history(self, company):
-        """A cég teljes előzmény-listájának végleges törlése (egy kötegelt kérésben)."""
         docs = self._list(f'companies/{company}/history')
         self._commit([self._delete_write(f'companies/{company}/history/{d["_id"]}') for d in docs])
 
+    def delete_all_aliases(self, company):
+        docs = self._list('company_aliases')
+        matching = [d['_id'] for d in docs if d.get('company') == company]
+        self._commit([self._delete_write(f'company_aliases/{doc_id}') for doc_id in matching])
+
     def cleanup_expired(self, company):
-        """A megőrzési időn túli (RETENTION_MONTHS-nál régebben consumed)
-        rekordok végleges törlése, egy kötegelt kérésben. Visszaadja a törölt
-        rekordok számát."""
         today = ym_today()
         expired = [doc['_id'] for doc in self._list(f'companies/{company}/memory')
                   if doc.get('status') == 'consumed' and doc.get('consumed_in')
@@ -297,6 +283,5 @@ class FirebaseStore:
                       json_body={'fields': _fields({'company': company})})
 
     def list_companies(self):
-        """Az eddig megismert cégek egyedi, rendezett listája."""
         return sorted({doc['company'] for doc in self._list('company_aliases')
                        if doc.get('company')})

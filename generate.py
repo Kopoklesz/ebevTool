@@ -55,7 +55,6 @@ def iso_to_serial(iso):
 
 
 def entry_key(entry):
-    """Dedup kulcs: adóazonosító|kezdés dátuma (év-hó-nap)|munkanapok."""
     return f"{entry['adoazonosito']}|{serial_to_iso(entry['start_serial'])}|{entry['munkanapok']}"
 
 
@@ -89,7 +88,6 @@ def is_hibas(row):
 
 
 def read_input(input_path):
-    """Beolvassa a bemeneti fájlt, visszaadja a fejlécet és az adatsorokat."""
     wb_in = load_workbook(input_path)
     if 'e-bev' in wb_in.sheetnames:
         ws_in = wb_in['e-bev']
@@ -104,7 +102,6 @@ def read_input(input_path):
 
 
 def check_header(header):
-    """Fejléc sanity-check: a lista elemei az észlelt problémák (üres = rendben)."""
     if header is None:
         return ['A fejléc sor hiányzik (üres fájl).']
     problems = []
@@ -120,13 +117,6 @@ def check_header(header):
 
 
 def extract_entries(data_rows):
-    """A sorokból kinyeri a rekordokat.
-
-    Visszatérés: (current_month_serial, current_entries, future_entries)
-    - current_entries: a fájl hónapjába (vagy korábbra) eső kezdések
-    - future_entries: jövőbeli hónapban kezdődők (várakozási sorba kerülnek)
-    Az aktuális hónapot a bejelentési dátumok leggyakoribb hónapja adja.
-    """
     active_rows = [r for r in data_rows if not is_torles(r) and not is_hibas(r)]
 
     bejelentes_months = {}
@@ -163,7 +153,6 @@ def extract_entries(data_rows):
 
 
 def merge_entries(current_entries, carried_entries):
-    """A fájlból jövő és az áthozott rekordok egyesítése, dedup kulcs szerint."""
     merged = list(current_entries)
     seen = {entry_key(e) for e in current_entries}
     for e in carried_entries:
@@ -174,7 +163,6 @@ def merge_entries(current_entries, carried_entries):
 
 
 def generate_output(input_path, header, data_rows, entries, output_path=None):
-    """Legenerálja a statisztika munkafüzetet, visszaadja a kimeneti útvonalat."""
     by_date = {}
     by_name = {}
 

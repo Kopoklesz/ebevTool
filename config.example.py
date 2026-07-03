@@ -1,8 +1,11 @@
 """Konfigurációs sablon.
 
-Másold le ezt a fájlt `config.py` néven, és töltsd ki az értékeket a
-FIREBASE_SETUP.md útmutató alapján. A config.py NEM kerül verziókezelésbe
-(.gitignore), de a PyInstaller build belefordítja az exe-be.
+Ezt a fájlt jellemzően nem kell kézzel szerkeszteni: az alkalmazás oldalsávjában
+a ⚙ Beállítások ablak automatikusan létrehozza/frissíti a `config.py`-t az
+.exe (vagy a gui.py) mellett.
+
+Kézi szerkesztéshez: másold le ezt a fájlt `config.py` néven, és töltsd ki az
+értékeket a FIREBASE_SETUP.md útmutató alapján.
 """
 
 # Firebase projekt Web API kulcsa (Project settings → General → Web API Key).
