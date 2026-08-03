@@ -43,6 +43,9 @@ szereplő **foglalkoztatói adószám** alapján történik.
   év-hónap szerint; csak fájlnév + időpont, tartalom nélkül).
 - **Várakozási sor / Böngésző** nézet: a Firestore-ban tárolt rekordok
   dekódolt böngészése és manuális törlése.
+- **Személyek** nézet: TAJ-hoz kötött, titkosítva tárolt személyi adatok
+  (szül. név, anyja neve, szül. hely/idő, lakcím). Ismeretlen TAJ-nál a
+  feldolgozás rákérdez, és a `Név Szerint` lap adatlapjait ezekből tölti ki.
 - **Helyi archívum**: a kimeneti fájl másolata automatikusan a
   `archívum/<Cég>/<év-hónap>/` mappába kerül, így később is visszakereshető.
 - **Automatikus frissítés**: az alkalmazás induláskor csendben megnézi, van-e
@@ -55,7 +58,7 @@ szereplő **foglalkoztatói adószám** alapján történik.
 |---------------------------|-----------------------------------------------------------|
 | forrásadat lap            | Az eredeti sorok, a törölt/hibás rekordok kiemelve — a lap neve a bemenettel egyezik (`Bejelentés adatok` vagy `e-bev`) |
 | `Dátum Szerint`           | Naponként kik dolgoztak                                   |
-| `Név Szerint`             | Személyenként a ledolgozott napok (kitölthető adatlappal) |
+| `Név Szerint`             | Személyenként a ledolgozott napok, a Személyek nézetből kitöltött adatlappal |
 | `ki hány napot dolgozott` | Havi bontású összesítés személyenként                     |
 
 A kimenet a bemeneti fájl mellé kerül `<fájlnév>_statisztika.xlsx` néven,
