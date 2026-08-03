@@ -111,6 +111,9 @@ service cloud.firestore {
     match /company_aliases/{token} {
       allow read, write: if request.auth != null;
     }
+    match /persons/{taj} {
+      allow read, write: if request.auth != null;
+    }
   }
 }"""
 
@@ -238,6 +241,7 @@ class App:
         self.queue_state = {'trees': {}, 'companies': []}
         self.update_available = None
 
+        self._persons = None  # None = még nem töltöttük be; dict = betöltött cache
         self._init_store()
 
         root.title('ebevTool – Statisztika generálás')
@@ -259,6 +263,7 @@ class App:
         global config
         config = load_runtime_config()
         self._online = None
+        self._persons = None
         if config is not None:
             self.store = FirebaseStore(config.FIREBASE_API_KEY,
                                        config.FIREBASE_PROJECT_ID,
@@ -289,6 +294,7 @@ class App:
         self._add_nav_button(nav, 'process', '📂  Feldolgozás', self.show_process)
         self._add_nav_button(nav, 'history', '🕒  Előzmények', self.show_history)
         self._add_nav_button(nav, 'queue', '📋  Várakozási sor', self.show_queue)
+        self._add_nav_button(nav, 'persons', '👤  Személyek', self.show_persons)
 
         ttk.Frame(sidebar, style='Sidebar.TFrame').pack(fill='both', expand=True)
 
@@ -319,6 +325,7 @@ class App:
         self.pages['process'] = self._build_process_page(self.content)
         self.pages['history'] = self._build_placeholder_page(self.content, '🕒  Előzmények')
         self.pages['queue'] = self._build_placeholder_page(self.content, '📋  Várakozási sor')
+        self.pages['persons'] = self._build_placeholder_page(self.content, '👤  Személyek')
         for page in self.pages.values():
             page.grid(row=0, column=0, sticky='nsew')
 
@@ -657,6 +664,50 @@ class App:
             return
         if ctx is None:
             return
+
+        if self._persons is not None:
+            self._process_file_check_persons(ctx)
+        else:
+            self.run_async(
+                self._load_persons_work,
+                lambda persons, error: self._on_persons_loaded_for_file(persons, error, ctx),
+                'Személyek betöltése...')
+
+    def _load_persons_work(self):
+        if not self.store:
+            return {}
+        online, _ = self._try_sign_in()
+        if not online:
+            return {}
+        try:
+            return self.store.load_persons()
+        except Exception:
+            return {}
+
+    def _on_persons_loaded_for_file(self, persons, error, ctx):
+        self._persons = persons or {}
+        self._process_file_check_persons(ctx)
+
+    def _process_file_check_persons(self, ctx):
+        all_entries = ctx['current_entries'] + ctx['future_entries']
+        seen_taj = set()
+        unknown_entries = []
+        for entry in all_entries:
+            taj = entry.get('taj', '').strip()
+            if taj and taj not in self._persons and taj not in seen_taj:
+                seen_taj.add(taj)
+                unknown_entries.append(entry)
+
+        new_persons = []
+        for entry in unknown_entries:
+            person_data = self._ask_person_dialog(entry['nev'], entry['taj'])
+            if person_data:
+                self._persons[entry['taj']] = person_data
+                new_persons.append(person_data)
+
+        ctx['persons'] = dict(self._persons)
+        ctx['new_persons'] = new_persons
+
         self.run_async(
             lambda: self._process_file_async(ctx),
             lambda result, error: self._process_file_finish(ctx, result, error),
@@ -771,8 +822,17 @@ class App:
         logs.append(('text', f"Rekordok a fájlból: {len(ctx['current_entries'])}, átvitt: {len(carried)}, "
                              f"jövő hónapra: {len(ctx['future_entries'])}"))
 
-        output_file = generate.generate_output(ctx['path'], ctx['header'], ctx['data_rows'],
-                                               entries, fmt=ctx['format'])
+        if online and ctx.get('new_persons'):
+            for person in ctx['new_persons']:
+                try:
+                    self.store.save_person(person)
+                except Exception as e:
+                    logs.append(('text', f'Személy mentése Firestore-ba sikertelen: {e}'))
+            logs.append(('text', f"{len(ctx['new_persons'])} új személy elmentve az adatbázisba."))
+
+        output_file = generate.generate_output(
+            ctx['path'], ctx['header'], ctx['data_rows'], entries,
+            fmt=ctx['format'], persons=ctx.get('persons'))
         logs.append(('link', 'Kész! Kimenet: ', output_file))
 
         try:
@@ -1449,7 +1509,8 @@ class App:
         items = ('•  Helyi alias-cache (aliases.json)\n'
                  '•  Az állapot napló tartalma\n'
                  '•  A Firestore teljes várakozási sora és előzményei\n'
-                 '   (MINDEN ismert cégnél)')
+                 '   (MINDEN ismert cégnél)\n'
+                 '•  A Firestore-ban tárolt összes személyes profil')
         ttk.Label(dlg, text=items, background=COLORS['card'], foreground=COLORS['muted'],
                   justify='left', font=FONT_BASE).pack(padx=24, pady=(8, 4), anchor='w')
         ttk.Label(dlg, text='A művelet nem vonható vissza.', background=COLORS['card'],
@@ -1497,12 +1558,17 @@ class App:
                 companies = self.known_companies()
                 self._parallel_map(companies, wipe_company)
                 done_companies = companies
+                try:
+                    self.store.delete_all_persons()
+                except Exception:
+                    pass
             return {'online': online, 'error': err, 'companies': done_companies}
 
         self.run_async(work, self._on_reset_done, 'Nullázás folyamatban...')
 
     def _on_reset_done(self, result, error):
         filename_utils.reset_local_aliases()
+        self._persons = None
         self.status.configure(state='normal')
         self.status.delete('1.0', 'end')
         self.status.configure(state='disabled')
@@ -1528,6 +1594,235 @@ class App:
             self.show_history()
         elif self.current_page == 'queue':
             self.show_queue()
+        elif self.current_page == 'persons':
+            self.show_persons()
+
+
+    # --- Személyek nézet ---
+
+    def show_persons(self):
+        self._activate_nav('persons')
+        page = self.pages['persons']
+        page.tkraise()
+        if not self.store:
+            self._render_page_message(page, 'Nincs beállítva Firebase-kapcsolat (töltsd ki a ⚙ Beállítások ablakot).')
+            return
+
+        def work():
+            online, err = self._try_sign_in()
+            if not online:
+                return {'online': False, 'error': err}
+            persons = self.store.load_persons()
+            return {'online': True, 'persons': persons}
+
+        self.run_async(work, self._on_persons_loaded_for_page, 'Személyek betöltése...')
+
+    def _on_persons_loaded_for_page(self, result, error):
+        page = self.pages['persons']
+        if error:
+            self._render_page_message(page, f'Hiba a személyek betöltésekor: {error}')
+            return
+        if not result['online']:
+            extra = f' ({result["error"]})' if result.get('error') else ''
+            self._render_page_message(page, f'A Firestore nem érhető el.{extra}')
+            return
+
+        persons = result['persons']
+        self._persons = persons
+
+        self._clear_body(page)
+
+        btns_frame = ttk.Frame(page.body)
+        btns_frame.pack(side='bottom', fill='x', pady=(10, 0))
+        ttk.Button(btns_frame, text='✏  Szerkesztés', style='Secondary.TButton',
+                   command=self._edit_selected_person).pack(side='left')
+        ttk.Button(btns_frame, text='🗑  Törlés', style='Secondary.TButton',
+                   command=self._delete_selected_person).pack(side='left', padx=8)
+        ttk.Button(btns_frame, text='🔄  Frissítés', style='Secondary.TButton',
+                   command=self.show_persons).pack(side='left')
+
+        cols = ('taj', 'szul_nev', 'anya_neve', 'szul_hely_ido', 'lakcim')
+        col_spec = {
+            '#0': ('Név', 160),
+            'taj': ('TAJ-szám', 105),
+            'szul_nev': ('Szül. név', 140),
+            'anya_neve': ('Anyja neve', 140),
+            'szul_hely_ido': ('Szül.hely, idő', 160),
+            'lakcim': ('Lakcím', 180),
+        }
+        tree = self._make_tree(page.body, cols, col_spec)
+        self._persons_tree = tree
+        tree.bind('<Double-1>', lambda e: self._edit_selected_person())
+
+        if not persons:
+            wrap = ttk.Frame(page.body)
+            wrap.place(relx=0.5, rely=0.4, anchor='center')
+            ttk.Label(wrap, text='👤', font=('Segoe UI', 24), background=COLORS['bg']).pack()
+            ttk.Label(wrap, text='Még nincsenek személyek rögzítve.\nGeneráláskor a rendszer rákérdez az ismeretlen személyekre.',
+                      style='Muted.TLabel', wraplength=360, justify='center').pack(pady=(8, 0))
+            return
+
+        for i, (taj, p) in enumerate(sorted(persons.items(), key=lambda x: x[1].get('nev', '').lower())):
+            tree.insert('', 'end', iid=taj, text=p.get('nev', ''),
+                        values=(p.get('taj', ''), p.get('szul_nev', ''), p.get('anya_neve', ''),
+                                p.get('szul_hely_ido', ''), p.get('lakcim', '')),
+                        tags=('odd' if i % 2 else 'even',))
+
+    def _edit_selected_person(self):
+        if not hasattr(self, '_persons_tree'):
+            return
+        tree = self._persons_tree
+        sel = tree.selection()
+        if not sel:
+            messagebox.showinfo('Szerkesztés', 'Válassz ki egy személyt a listából.')
+            return
+        taj = sel[0]
+        person = (self._persons or {}).get(taj)
+        if not person:
+            return
+        self._open_person_edit_dialog(person)
+
+    def _delete_selected_person(self):
+        if not hasattr(self, '_persons_tree'):
+            return
+        tree = self._persons_tree
+        sel = tree.selection()
+        if not sel:
+            messagebox.showinfo('Törlés', 'Válassz ki egy személyt a listából.')
+            return
+        taj = sel[0]
+        person = (self._persons or {}).get(taj, {})
+        nev = person.get('nev', taj)
+        if not messagebox.askyesno('Törlés megerősítése',
+                                   f'Véglegesen törlöd {nev} adatait az adatbázisból?'):
+            return
+
+        def work():
+            self.store.delete_person(taj)
+
+        def done(_, error):
+            if error:
+                messagebox.showerror('Hiba', f'Törlés sikertelen: {error}')
+                return
+            if self._persons and taj in self._persons:
+                del self._persons[taj]
+            self.show_persons()
+
+        self.run_async(work, done, 'Törlés...')
+
+    def _open_person_edit_dialog(self, person, on_save=None):
+        dlg = tk.Toplevel(self.root)
+        dlg.title('Személy szerkesztése')
+        dlg.configure(bg=COLORS['card'])
+        dlg.grab_set()
+        dlg.resizable(False, False)
+
+        ttk.Label(dlg, text='✏️', font=('Segoe UI', 22), background=COLORS['card']).pack(pady=(18, 4))
+        ttk.Label(dlg, text=person.get('nev', ''), background=COLORS['card'],
+                  font=FONT_BOLD).pack()
+        ttk.Label(dlg, text=f"TAJ: {person.get('taj', '')}", background=COLORS['card'],
+                  foreground=COLORS['muted'], font=FONT_BASE).pack(pady=(0, 10))
+
+        form = ttk.Frame(dlg, style='Card.TFrame')
+        form.pack(padx=24, fill='x')
+        form.grid_columnconfigure(1, weight=1)
+
+        fields = [
+            ('szul_nev', 'Születési név:'),
+            ('anya_neve', 'Anyja neve:'),
+            ('szul_hely_ido', 'Szül.hely, idő:'),
+            ('lakcim', 'Lakcím:'),
+        ]
+        vars_ = {}
+        for r, (key, label) in enumerate(fields):
+            ttk.Label(form, text=label, background=COLORS['card'], font=FONT_BASE).grid(
+                row=r, column=0, sticky='w', pady=(0, 8), padx=(0, 10))
+            var = tk.StringVar(value=person.get(key, ''))
+            ttk.Entry(form, textvariable=var, width=34).grid(row=r, column=1, sticky='ew', pady=(0, 8))
+            vars_[key] = var
+
+        status_lbl = ttk.Label(dlg, text='', background=COLORS['card'],
+                               foreground=COLORS['success'], font=FONT_BASE)
+        status_lbl.pack(padx=24, pady=(4, 0))
+
+        def do_save():
+            updated = dict(person)
+            for key, var in vars_.items():
+                updated[key] = var.get().strip()
+
+            def work():
+                self.store.save_person(updated)
+                return updated
+
+            def done(result, error):
+                if error:
+                    messagebox.showerror('Hiba', f'Mentés sikertelen: {error}')
+                    return
+                if self._persons is not None:
+                    self._persons[updated['taj']] = updated
+                status_lbl.configure(text='✓ Elmentve')
+                if on_save:
+                    on_save(updated)
+                dlg.after(700, dlg.destroy)
+                self.show_persons()
+
+            self.run_async(work, done, 'Mentés...')
+
+        btns = ttk.Frame(dlg, style='Card.TFrame')
+        btns.pack(pady=(8, 20))
+        ttk.Button(btns, text='Mégse', style='Secondary.TButton', command=dlg.destroy).pack(side='left', padx=6)
+        ttk.Button(btns, text='Mentés', style='Accent.TButton', command=do_save).pack(side='left', padx=6)
+        dlg.bind('<Return>', lambda e: do_save())
+        dlg.bind('<Escape>', lambda e: dlg.destroy())
+
+    def _ask_person_dialog(self, nev, taj):
+        result = {'data': None}
+        dlg = tk.Toplevel(self.root)
+        dlg.title('Ismeretlen személy')
+        dlg.configure(bg=COLORS['card'])
+        dlg.grab_set()
+        dlg.resizable(False, False)
+
+        ttk.Label(dlg, text='👤', font=('Segoe UI', 22), background=COLORS['card']).pack(pady=(18, 4))
+        ttk.Label(dlg, text='Ismeretlen személy', background=COLORS['card'], font=FONT_BOLD).pack()
+        ttk.Label(dlg, text=f'{nev}  •  TAJ: {taj}', background=COLORS['card'],
+                  foreground=COLORS['muted'], font=FONT_BASE).pack(pady=(2, 4))
+        ttk.Label(dlg, text='Add meg az adatait, vagy hagyd üresen és nyomj OK-t\n'
+                            '(ha üres, nem kerül az Excelbe és nem mentjük el).',
+                  background=COLORS['card'], foreground=COLORS['muted'], font=FONT_BASE,
+                  justify='center', wraplength=360).pack(padx=24, pady=(0, 12))
+
+        form = ttk.Frame(dlg, style='Card.TFrame')
+        form.pack(padx=24, fill='x')
+        form.grid_columnconfigure(1, weight=1)
+
+        fields = [
+            ('szul_nev', 'Születési név:'),
+            ('anya_neve', 'Anyja neve:'),
+            ('szul_hely_ido', 'Szül.hely, idő:'),
+            ('lakcim', 'Lakcím:'),
+        ]
+        vars_ = {}
+        for r, (key, label) in enumerate(fields):
+            ttk.Label(form, text=label, background=COLORS['card'], font=FONT_BASE).grid(
+                row=r, column=0, sticky='w', pady=(0, 8), padx=(0, 10))
+            var = tk.StringVar()
+            ttk.Entry(form, textvariable=var, width=34).grid(row=r, column=1, sticky='ew', pady=(0, 8))
+            vars_[key] = var
+
+        def do_ok():
+            values = {k: v.get().strip() for k, v in vars_.items()}
+            if any(values.values()):
+                result['data'] = {'taj': taj, 'nev': nev, **values}
+            dlg.destroy()
+
+        btns = ttk.Frame(dlg, style='Card.TFrame')
+        btns.pack(pady=(8, 20))
+        ttk.Button(btns, text='OK', style='Accent.TButton', command=do_ok).pack(padx=6)
+        dlg.bind('<Return>', lambda e: do_ok())
+        dlg.bind('<Escape>', lambda e: dlg.destroy())
+        dlg.wait_window()
+        return result['data']
 
 
 def main():

@@ -285,3 +285,58 @@ class FirebaseStore:
     def list_companies(self):
         return sorted({doc['company'] for doc in self._list('company_aliases')
                        if doc.get('company')})
+
+    # --- személyek (TAJ-hoz kötött profil, titkosítva) ---
+
+    def _encrypt_person(self, person):
+        payload = {
+            'taj': person.get('taj', ''),
+            'nev': person.get('nev', ''),
+            'szul_nev': person.get('szul_nev', ''),
+            'anya_neve': person.get('anya_neve', ''),
+            'szul_hely_ido': person.get('szul_hely_ido', ''),
+            'lakcim': person.get('lakcim', ''),
+        }
+        raw = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+        return self.fernet.encrypt(raw).decode('ascii')
+
+    def _decrypt_person(self, token):
+        payload = json.loads(self.fernet.decrypt(token.encode('ascii')))
+        return {
+            'taj': payload.get('taj', ''),
+            'nev': payload.get('nev', ''),
+            'szul_nev': payload.get('szul_nev', ''),
+            'anya_neve': payload.get('anya_neve', ''),
+            'szul_hely_ido': payload.get('szul_hely_ido', ''),
+            'lakcim': payload.get('lakcim', ''),
+        }
+
+    @staticmethod
+    def _taj_doc_id(taj):
+        normalized = ''.join(c for c in taj if c.isdigit())
+        return hashlib.sha256(normalized.encode('utf-8')).hexdigest()[:32]
+
+    def load_persons(self):
+        persons = {}
+        for doc in self._list('persons'):
+            try:
+                person = self._decrypt_person(doc['payload'])
+                persons[person['taj']] = person
+            except Exception:
+                continue
+        return persons
+
+    def save_person(self, person):
+        doc_id = self._taj_doc_id(person['taj'])
+        self._commit([self._update_write(f'persons/{doc_id}', {
+            'payload': self._encrypt_person(person),
+            'updated_at': _now_iso(),
+        })])
+
+    def delete_person(self, taj):
+        doc_id = self._taj_doc_id(taj)
+        self._request('DELETE', f'persons/{doc_id}')
+
+    def delete_all_persons(self):
+        docs = self._list('persons')
+        self._commit([self._delete_write(f'persons/{d["_id"]}') for d in docs])

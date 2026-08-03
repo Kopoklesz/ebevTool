@@ -278,7 +278,8 @@ def merge_entries(current_entries, carried_entries):
 
 
 def generate_output(input_path, header, data_rows, entries, output_path=None,
-                    fmt=DEFAULT_FORMAT):
+                    fmt=DEFAULT_FORMAT, persons=None):
+    persons = persons or {}
     by_date = {}
     by_name = {}
 
@@ -333,13 +334,14 @@ def generate_output(input_path, header, data_rows, entries, output_path=None,
     ws_nev = wb_out.create_sheet('Név Szerint')
     for nev in sorted_names:
         info = by_name[nev]
+        p = persons.get(info['taj'], {})
         ws_nev.append(['név:', nev, '', '', ''])
-        ws_nev.append(['szül.név', '', '', '', ''])
-        ws_nev.append(['anyja neve:', '', '', '', ''])
-        ws_nev.append(['szül.hely, idő:', '', '', '', ''])
+        ws_nev.append(['szül.név', p.get('szul_nev', ''), '', '', ''])
+        ws_nev.append(['anyja neve:', p.get('anya_neve', ''), '', '', ''])
+        ws_nev.append(['szül.hely, idő:', p.get('szul_hely_ido', ''), '', '', ''])
         ws_nev.append(['adóazonosító:', info['adoazonosito'], '', '', ''])
         ws_nev.append(['TAJ-szám:', info['taj'], '', '', ''])
-        ws_nev.append(['lakcím:', '', '', '', ''])
+        ws_nev.append(['lakcím:', p.get('lakcim', ''), '', '', ''])
         ws_nev.append([''] * 5)
         unique_dates = sorted(info['dates'])
         for serial in unique_dates:
