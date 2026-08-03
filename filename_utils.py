@@ -56,7 +56,7 @@ def alias_token(filename):
     megjegyzett céghez tartozik.
 
     Az új NAV-export fájlneve nem tartalmaz cégnevet, csak a foglalkoztató
-    adószámát ('Egyszerusitett_21916704_5017127242648694.xlsx') — itt az
+    adószámát ('Egyszerusitett_<adószám>_<riportazonosító>.xlsx') — itt az
     adószám azonosítja a céget. Enélkül minden cég ugyanarra az
     'EGYSZERUSITETT' tokenre esne össze.
     """
