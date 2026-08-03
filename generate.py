@@ -6,18 +6,80 @@ from openpyxl.utils import get_column_letter
 
 EPOCH = datetime(1899, 12, 30)
 
-# Pozíció alapú oszlopkiosztás a bemeneti 'e-bev' lapon
-COL_NEV = 0
-COL_ADOAZON = 1
-COL_BEJELENTES = 2
-COL_TORLES = 3
-COL_KEZDES = 5
-COL_MUNKANAPOK = 7
-COL_TAJ = 8
-COL_HIBA = 9
-USED_COLUMNS = (COL_NEV, COL_ADOAZON, COL_BEJELENTES, COL_TORLES,
-                COL_KEZDES, COL_MUNKANAPOK, COL_TAJ, COL_HIBA)
-MIN_COLUMNS = max(USED_COLUMNS) + 1
+# --- támogatott bemeneti formátumok ---
+#
+# A bemeneti fájl kétféle lehet:
+#   * 'legacy'  – a régi 'e-bev' munkalap
+#   * 'nav2026' – az új NAV-export ('Bejelentés adatok' munkalap,
+#                 pl. Egyszerusitett_<adószám>_<riportazonosító>.xlsx)
+#
+# Az oszlopfelismerés továbbra is pozíció alapú, de a formátumot a munkalap
+# neve és a fejléc tartalma alapján automatikusan felismerjük.
+
+
+class InputFormat:
+    """Egy bemeneti formátum pozíció alapú oszlopkiosztása.
+
+    A 'torles' és 'hiba' oszlopok kétféleképp működhetnek:
+      * marker módban a cellában szereplő szó jelzi az állapotot (régi fájl),
+      * expected módban a cella normál esetben egy fix értéket tartalmaz, és
+        minden ettől eltérő érték jelenti a törlést / hibát (új NAV-export,
+        ahol nem ismert előre a törölt vagy hibás sorok pontos szövege).
+    """
+
+    def __init__(self, key, label, sheet_names, header_keywords, columns,
+                 torles=None, hiba=None, output_sheet=None):
+        self.key = key
+        self.label = label
+        self.sheet_names = sheet_names
+        self.output_sheet = output_sheet or sheet_names[0]
+        self.header_keywords = header_keywords
+        self.columns = columns
+        self.torles = torles
+        self.hiba = hiba
+
+        used = list(columns.values())
+        for rule in (torles, hiba):
+            if rule:
+                used.append(rule['col'])
+        self.used_columns = tuple(sorted(set(used)))
+        self.min_columns = max(self.used_columns) + 1
+
+    def col(self, name):
+        return self.columns[name]
+
+
+LEGACY_FORMAT = InputFormat(
+    key='legacy',
+    label="régi 'e-bev' formátum",
+    sheet_names=('e-bev',),
+    header_keywords=(),
+    columns={'nev': 0, 'adoazonosito': 1, 'bejelentes': 2,
+             'kezdes': 5, 'munkanapok': 7, 'taj': 8},
+    torles={'col': 3, 'mode': 'marker', 'markers': ('törlés',)},
+    hiba={'col': 9, 'mode': 'marker', 'markers': ('hibás', 'hiba')},
+)
+
+NAV2026_FORMAT = InputFormat(
+    key='nav2026',
+    label="új NAV-export ('Bejelentés adatok')",
+    sheet_names=('bejelentés adatok',),
+    header_keywords=('munkavállaló neve', 'adóazonosító jele', 'taj száma',
+                     'munkanapok száma', 'bejelentés jellege'),
+    # A oszlop = sorszám (nem használjuk), az adatok B-től kezdődnek.
+    columns={'nev': 1, 'adoazonosito': 2, 'taj': 3,
+             'kezdes': 5, 'munkanapok': 7, 'bejelentes': 13},
+    # I oszlop: 'Bejelentés jellege' – normál esetben 'Új'; minden más
+    # (törlés, visszavonás, módosítás) törölt rekordnak számít.
+    torles={'col': 8, 'mode': 'expected', 'expected': ('új',)},
+    # K oszlop: 'Adatlap feldolgozottsági státusza' – normál esetben
+    # 'FELDOLGOZOTT'; minden más érték hibás rekordot jelöl.
+    hiba={'col': 10, 'mode': 'expected', 'expected': ('feldolgozott',)},
+    output_sheet='Bejelentés adatok',
+)
+
+FORMATS = (NAV2026_FORMAT, LEGACY_FORMAT)
+DEFAULT_FORMAT = LEGACY_FORMAT
 
 
 def date_str_to_serial(date_str):
@@ -76,39 +138,86 @@ def autofit(ws):
         ws.column_dimensions[col_letter].width = max(max_len + 2, 8)
 
 
-def is_torles(row):
-    return len(row) > COL_TORLES and str(row[COL_TORLES]).strip() == 'Törlés'
+def cell_text(row, idx):
+    if idx is None or len(row) <= idx or row[idx] is None:
+        return ''
+    return str(row[idx]).strip()
 
 
-def is_hibas(row):
-    if len(row) <= COL_HIBA:
-        return False
-    s = str(row[COL_HIBA]).strip().lower()
-    return s in ('hibás', 'hiba')
+def _flag_value(row, rule):
+    """A törlés/hiba szabály által jelzett érték, vagy '' ha a sor rendben van."""
+    if not rule:
+        return ''
+    value = cell_text(row, rule['col'])
+    if rule['mode'] == 'marker':
+        return value if value.lower() in rule['markers'] else ''
+    # expected mód: üres cellát nem tekintünk eltérésnek (hiányzó adat, nem hiba)
+    if not value:
+        return ''
+    return '' if value.lower() in rule['expected'] else value
+
+
+def torles_value(row, fmt=DEFAULT_FORMAT):
+    return _flag_value(row, fmt.torles)
+
+
+def hiba_value(row, fmt=DEFAULT_FORMAT):
+    return _flag_value(row, fmt.hiba)
+
+
+def is_torles(row, fmt=DEFAULT_FORMAT):
+    return bool(torles_value(row, fmt))
+
+
+def is_hibas(row, fmt=DEFAULT_FORMAT):
+    return bool(hiba_value(row, fmt))
+
+
+def detect_format(sheet_title, header):
+    """A munkalap neve és a fejléc alapján felismert bemeneti formátum."""
+    title = (sheet_title or '').strip().lower()
+    for fmt in FORMATS:
+        if title in fmt.sheet_names:
+            return fmt
+
+    header_text = ' | '.join(str(h).strip().lower() for h in (header or []) if h)
+    for fmt in FORMATS:
+        if fmt.header_keywords and all(kw in header_text for kw in fmt.header_keywords):
+            return fmt
+    return DEFAULT_FORMAT
+
+
+def _pick_sheet(wb_in):
+    by_title = {ws.title.strip().lower(): ws for ws in wb_in.worksheets}
+    for fmt in FORMATS:
+        for name in fmt.sheet_names:
+            if name in by_title:
+                return by_title[name]
+    return wb_in.active
 
 
 def read_input(input_path):
     wb_in = load_workbook(input_path)
-    if 'e-bev' in wb_in.sheetnames:
-        ws_in = wb_in['e-bev']
-    else:
-        ws_in = wb_in.active
+    ws_in = _pick_sheet(wb_in)
     all_rows = list(ws_in.values)
     if not all_rows:
-        return None, []
+        return None, [], DEFAULT_FORMAT
     header = all_rows[0]
-    data_rows = [r for r in all_rows[1:] if r[0] and str(r[0]).strip()]
-    return header, data_rows
+    fmt = detect_format(ws_in.title, header)
+    key_col = fmt.col('nev')
+    data_rows = [r for r in all_rows[1:]
+                 if len(r) > key_col and r[key_col] and str(r[key_col]).strip()]
+    return header, data_rows, fmt
 
 
-def check_header(header):
+def check_header(header, fmt=DEFAULT_FORMAT):
     if header is None:
         return ['A fejléc sor hiányzik (üres fájl).']
     problems = []
-    if len(header) < MIN_COLUMNS:
+    if len(header) < fmt.min_columns:
         problems.append(
-            f'A fejléc csak {len(header)} oszlopot tartalmaz, legalább {MIN_COLUMNS} szükséges.')
-    for idx in USED_COLUMNS:
+            f'A fejléc csak {len(header)} oszlopot tartalmaz, legalább {fmt.min_columns} szükséges.')
+    for idx in fmt.used_columns:
         if idx < len(header):
             val = header[idx]
             if val is None or not str(val).strip():
@@ -116,12 +225,18 @@ def check_header(header):
     return problems
 
 
-def extract_entries(data_rows):
-    active_rows = [r for r in data_rows if not is_torles(r) and not is_hibas(r)]
+def extract_entries(data_rows, fmt=DEFAULT_FORMAT):
+    active_rows = [r for r in data_rows
+                   if not is_torles(r, fmt) and not is_hibas(r, fmt)]
+
+    c_bejelentes = fmt.col('bejelentes')
+    c_kezdes = fmt.col('kezdes')
+    c_munkanapok = fmt.col('munkanapok')
 
     bejelentes_months = {}
     for r in active_rows:
-        s = date_str_to_serial(str(r[COL_BEJELENTES]).split(' ')[0]) if r[COL_BEJELENTES] else None
+        raw = cell_text(r, c_bejelentes)
+        s = date_str_to_serial(raw.split(' ')[0]) if raw else None
         if s:
             ms = serial_to_month_serial(s)
             bejelentes_months[ms] = bejelentes_months.get(ms, 0) + 1
@@ -131,16 +246,16 @@ def extract_entries(data_rows):
     future_entries = []
     for r in active_rows:
         try:
-            munkanapok = int(r[COL_MUNKANAPOK])
+            munkanapok = int(r[c_munkanapok])
         except Exception:
             munkanapok = 1
-        start_serial = date_str_to_serial(r[COL_KEZDES])
+        start_serial = date_str_to_serial(cell_text(r, c_kezdes))
         if start_serial is None:
             continue
         entry = {
-            'nev': str(r[COL_NEV]).strip(),
-            'adoazonosito': str(r[COL_ADOAZON]).strip(),
-            'taj': str(r[COL_TAJ]).strip(),
+            'nev': cell_text(r, fmt.col('nev')),
+            'adoazonosito': cell_text(r, fmt.col('adoazonosito')),
+            'taj': cell_text(r, fmt.col('taj')),
             'start_serial': start_serial,
             'munkanapok': munkanapok,
         }
@@ -162,7 +277,8 @@ def merge_entries(current_entries, carried_entries):
     return merged
 
 
-def generate_output(input_path, header, data_rows, entries, output_path=None):
+def generate_output(input_path, header, data_rows, entries, output_path=None,
+                    fmt=DEFAULT_FORMAT):
     by_date = {}
     by_name = {}
 
@@ -187,15 +303,15 @@ def generate_output(input_path, header, data_rows, entries, output_path=None):
     BLUE_FILL = PatternFill("solid", fgColor="4472C4")
     WHITE_FONT = Font(color="FFFFFF", bold=True)
 
-    # e-bev lap (aktuális fájl)
-    ws_ebev = wb_out.create_sheet('e-bev')
+    # forrásadat lap (aktuális fájl) – a bemeneti munkalap nevével
+    ws_ebev = wb_out.create_sheet(fmt.output_sheet)
     ws_ebev.append(list(header))
     for r in data_rows:
         ws_ebev.append(list(r))
         row_idx = ws_ebev.max_row
-        if is_hibas(r):
+        if is_hibas(r, fmt):
             fill, font = RED_FILL, WHITE_FONT
-        elif is_torles(r):
+        elif is_torles(r, fmt):
             fill, font = BLUE_FILL, WHITE_FONT
         else:
             continue

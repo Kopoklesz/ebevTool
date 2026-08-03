@@ -38,8 +38,10 @@ import webbrowser
 import generate
 import filename_utils
 import dpapi_crypto
+import updater
 from dpapi_crypto import DPAPIError
 from firebase_store import FirebaseError, FirebaseStore, months_between, ym_today
+from version import RELEASES_PAGE, __version__
 
 CONFIG_FIELDS = ('FIREBASE_API_KEY', 'FIREBASE_PROJECT_ID', 'FERNET_KEY', 'ARCHIVE_DIR')
 
@@ -234,6 +236,7 @@ class App:
         self.nav_buttons = {}
         self.history_state = {}
         self.queue_state = {'trees': {}, 'companies': []}
+        self.update_available = None
 
         self._init_store()
 
@@ -278,6 +281,8 @@ class App:
         brand.pack(fill='x', pady=(20, 24), padx=18)
         ttk.Label(brand, text='📊  ebevTool', style='Brand.TLabel').pack(anchor='w')
         ttk.Label(brand, text='Statisztika generálás', style='BrandSub.TLabel').pack(anchor='w', pady=(2, 0))
+        self.version_label = ttk.Label(brand, text=f'v{__version__}', style='BrandSub.TLabel')
+        self.version_label.pack(anchor='w')
 
         nav = ttk.Frame(sidebar, style='Sidebar.TFrame')
         nav.pack(fill='x')
@@ -286,6 +291,11 @@ class App:
         self._add_nav_button(nav, 'queue', '📋  Várakozási sor', self.show_queue)
 
         ttk.Frame(sidebar, style='Sidebar.TFrame').pack(fill='both', expand=True)
+
+        self.update_btn = ttk.Button(sidebar, text='🔄  Frissítés', style='Nav.TButton',
+                                     command=self.open_update)
+        self.update_btn.pack(fill='x', padx=10, pady=(0, 2))
+        self._busy_widgets.append(self.update_btn)
 
         settings_btn = ttk.Button(sidebar, text='⚙  Beállítások', style='Nav.TButton',
                                   command=self.open_settings)
@@ -666,8 +676,9 @@ class App:
             return None
         self.log(f'Cég: {company}')
 
-        header, data_rows = generate.read_input(path)
-        problems = generate.check_header(header)
+        header, data_rows, fmt = generate.read_input(path)
+        self.log(f'Felismert formátum: {fmt.label}')
+        problems = generate.check_header(header, fmt)
         if problems:
             msg = ('A fejléc szerkezete eltér a várttól, ellenőrizd a fájlt!\n\n'
                    + '\n'.join(problems) + '\n\nFolytatod a feldolgozást?')
@@ -675,8 +686,10 @@ class App:
                 self.log('Megszakítva a fejléc-ellenőrzés után.')
                 return None
 
+        self._log_flagged_rows(data_rows, fmt)
+
         current_month_serial, current_entries, future_entries = \
-            generate.extract_entries(data_rows)
+            generate.extract_entries(data_rows, fmt)
         if current_month_serial is None:
             messagebox.showerror(
                 'Hiba', 'Nem határozható meg a fájl hónapja (nincsenek '
@@ -705,10 +718,29 @@ class App:
 
         return {
             'path': path, 'filename': filename, 'company': company,
-            'header': header, 'data_rows': data_rows,
+            'header': header, 'data_rows': data_rows, 'format': fmt,
             'current_entries': current_entries, 'future_entries': future_entries,
             'ym': ym,
         }
+
+    def _log_flagged_rows(self, data_rows, fmt):
+        """A kiszűrt (törölt/hibás) sorok megszámolása, a talált értékekkel együtt.
+
+        Az új NAV-exportban nem ismert előre, milyen szöveggel jelöli a NAV a
+        törölt vagy hibás rekordokat, ezért a ténylegesen előforduló eltérő
+        értékeket kiírjuk a naplóba.
+        """
+        for label, value_fn in (('törölt', generate.torles_value),
+                                ('hibás', generate.hiba_value)):
+            values = {}
+            for row in data_rows:
+                value = value_fn(row, fmt)
+                if value:
+                    values[value] = values.get(value, 0) + 1
+            if values:
+                details = ', '.join(f'"{v}" ({n} db)' for v, n in sorted(values.items()))
+                total = sum(values.values())
+                self.log(f'Kiszűrve {total} {label} sor — {details}')
 
     def _process_file_async(self, ctx):
         logs = []
@@ -739,7 +771,8 @@ class App:
         logs.append(('text', f"Rekordok a fájlból: {len(ctx['current_entries'])}, átvitt: {len(carried)}, "
                              f"jövő hónapra: {len(ctx['future_entries'])}"))
 
-        output_file = generate.generate_output(ctx['path'], ctx['header'], ctx['data_rows'], entries)
+        output_file = generate.generate_output(ctx['path'], ctx['header'], ctx['data_rows'],
+                                               entries, fmt=ctx['format'])
         logs.append(('link', 'Kész! Kimenet: ', output_file))
 
         try:
@@ -991,6 +1024,204 @@ class App:
         tree.tag_configure('odd', background=COLORS['row_alt'])
         tree.tag_configure('even', background=COLORS['card'])
         return tree
+
+    # --- Frissítés ---
+
+    def check_update_silently(self):
+        """Induláskori, csendes verzióellenőrzés — hiba esetén nem szól bele."""
+        def work():
+            return updater.check_for_update()
+
+        def done(info, error):
+            if error or not info:
+                return
+            self.update_available = info
+            self.update_btn.configure(text='🔄  Frissítés  ●')
+            self.log(f"Új verzió érhető el: {info['version']} "
+                     f"(jelenlegi: {__version__}) — lásd a 🔄 Frissítés menüpontot.")
+
+        # csendes ellenőrzés: nincs betöltő overlay, nem blokkolja a munkát
+        def task():
+            try:
+                result = work()
+                self.root.after(0, lambda: done(result, None))
+            except Exception as e:
+                self.root.after(0, lambda: done(None, e))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def open_update(self):
+        dlg = tk.Toplevel(self.root)
+        dlg.title('Frissítés')
+        dlg.configure(bg=COLORS['card'])
+        dlg.grab_set()
+        dlg.resizable(False, False)
+
+        ttk.Label(dlg, text='🔄', font=('Segoe UI', 26), background=COLORS['card']).pack(pady=(20, 4))
+        ttk.Label(dlg, text='Alkalmazás frissítése', background=COLORS['card'],
+                  font=FONT_BOLD).pack(padx=24)
+        ttk.Label(dlg, text=f'Jelenlegi verzió:  {__version__}', background=COLORS['card'],
+                  foreground=COLORS['muted'], font=FONT_BASE).pack(padx=24, pady=(4, 0))
+
+        status = ttk.Label(dlg, text='', background=COLORS['card'], foreground=COLORS['text'],
+                           font=FONT_BASE, wraplength=420, justify='center')
+        status.pack(padx=24, pady=(10, 4))
+
+        notes = tk.Text(dlg, height=7, width=52, wrap='word', bd=0, bg=COLORS['row_alt'],
+                        fg=COLORS['text'], font=('Segoe UI', 9), padx=10, pady=8)
+        notes_visible = {'shown': False}
+
+        bar = ttk.Progressbar(dlg, mode='determinate', length=420)
+
+        btns = ttk.Frame(dlg, style='Card.TFrame')
+        btns.pack(pady=(10, 20))
+        close_btn = ttk.Button(btns, text='Bezárás', style='Secondary.TButton', command=dlg.destroy)
+        close_btn.pack(side='left', padx=6)
+        action_btn = ttk.Button(btns, text='Keresés...', style='Accent.TButton')
+        action_btn.state(['disabled'])
+        action_btn.pack(side='left', padx=6)
+
+        state = {'info': None, 'downloaded': None}
+
+        def show_notes(text):
+            if not text:
+                return
+            if not notes_visible['shown']:
+                notes.pack(padx=24, pady=(4, 4), before=btns)
+                notes_visible['shown'] = True
+            notes.configure(state='normal')
+            notes.delete('1.0', 'end')
+            notes.insert('1.0', text)
+            notes.configure(state='disabled')
+
+        # --- 3. lépés: telepítés ---
+
+        def do_install():
+            path = state['downloaded']
+            if not messagebox.askokcancel(
+                    'Újraindítás',
+                    'A frissítés telepítéséhez az alkalmazás bezárul, majd '
+                    'automatikusan újraindul az új verzióval.\n\nFolytatod?',
+                    parent=dlg):
+                return
+            try:
+                updater.apply_update(path)
+            except updater.UpdateError as e:
+                status.configure(text=str(e), foreground=COLORS['danger'])
+                return
+            self.root.destroy()
+
+        # --- 2. lépés: letöltés ---
+
+        def do_download():
+            action_btn.state(['disabled'])
+            close_btn.state(['disabled'])
+            status.configure(text='Letöltés folyamatban...', foreground=COLORS['text'])
+            bar.pack(padx=24, pady=(4, 8), before=btns)
+            bar['value'] = 0
+
+            def on_progress(done_bytes, total):
+                def update_bar():
+                    if total:
+                        bar['value'] = done_bytes * 100 / total
+                        status.configure(
+                            text=f'Letöltés: {done_bytes / 1048576:.1f} / {total / 1048576:.1f} MB')
+                    else:
+                        status.configure(text=f'Letöltés: {done_bytes / 1048576:.1f} MB')
+                self.root.after(0, update_bar)
+
+            def work():
+                return updater.download_asset(state['info'], progress=on_progress)
+
+            def done(path, error):
+                close_btn.state(['!disabled'])
+                if error:
+                    bar.pack_forget()
+                    status.configure(text=str(error), foreground=COLORS['danger'])
+                    action_btn.configure(text='Újra', command=do_download)
+                    action_btn.state(['!disabled'])
+                    return
+                state['downloaded'] = path
+                bar['value'] = 100
+                status.configure(text='A letöltés kész. A telepítéshez az alkalmazás '
+                                      'újraindul.', foreground=COLORS['success'])
+                action_btn.configure(text='Telepítés és újraindítás', command=do_install)
+                action_btn.state(['!disabled'])
+
+            threading.Thread(
+                target=lambda: self._thread_call(work, done), daemon=True).start()
+
+        # --- 1. lépés: keresés ---
+
+        def do_check():
+            action_btn.state(['disabled'])
+            status.configure(text='Frissítés keresése...', foreground=COLORS['text'])
+
+            def done(info, error):
+                if error:
+                    status.configure(text=str(error), foreground=COLORS['danger'])
+                    action_btn.configure(text='Újra', command=do_check)
+                    action_btn.state(['!disabled'])
+                    return
+                if not info:
+                    status.configure(text='Az alkalmazás naprakész. ✓',
+                                     foreground=COLORS['success'])
+                    action_btn.configure(text='Keresés újra', command=do_check)
+                    action_btn.state(['!disabled'])
+                    return
+
+                state['info'] = info
+                self.update_available = info
+                status.configure(text=f"Új verzió érhető el:  {info['version']}",
+                                 foreground=COLORS['text'])
+                show_notes(info['notes'])
+
+                if not updater.is_frozen():
+                    status.configure(
+                        text=f"Új verzió érhető el: {info['version']}\n\nForrásból futtatod "
+                             "(python gui.py), ezért az automatikus csere nem "
+                             "elérhető — frissíts 'git pull'-lal.",
+                        foreground=COLORS['text'])
+                    action_btn.configure(
+                        text='Kiadás megnyitása',
+                        command=lambda: webbrowser.open(info.get('page') or RELEASES_PAGE))
+                    action_btn.state(['!disabled'])
+                    return
+
+                if not info.get('url'):
+                    status.configure(
+                        text=f"Új verzió érhető el: {info['version']}\n\nEhhez a kiadáshoz "
+                             "nincs .exe csatolva, töltsd le kézzel.",
+                        foreground=COLORS['danger'])
+                    action_btn.configure(
+                        text='Kiadás megnyitása',
+                        command=lambda: webbrowser.open(info.get('page') or RELEASES_PAGE))
+                    action_btn.state(['!disabled'])
+                    return
+
+                size = info.get('asset_size')
+                if size:
+                    status.configure(text=f"Új verzió érhető el:  {info['version']}"
+                                          f"   ({size / 1048576:.1f} MB)")
+                action_btn.configure(text='Letöltés', command=do_download)
+                action_btn.state(['!disabled'])
+
+            threading.Thread(
+                target=lambda: self._thread_call(updater.check_for_update, done),
+                daemon=True).start()
+
+        action_btn.configure(command=do_check)
+        dlg.bind('<Escape>', lambda e: dlg.destroy())
+        # az ablak megnyitásakor rögtön indul a keresés
+        self.root.after(0, do_check)
+
+    def _thread_call(self, work_fn, on_done):
+        """work_fn futtatása háttérszálon, az eredmény a Tk szálon kézbesítve."""
+        try:
+            result = work_fn()
+            self.root.after(0, lambda: on_done(result, None))
+        except Exception as e:
+            self.root.after(0, lambda: on_done(None, e))
 
     # --- Beállítások (titkosított config.dat szerkesztése) ---
 
@@ -1300,8 +1531,10 @@ class App:
 
 
 def main():
+    updater.cleanup_leftovers()
     root = TkinterDnD.Tk() if DND_AVAILABLE else tk.Tk()
     app = App(root)
+    root.after(1500, app.check_update_silently)
     if len(sys.argv) > 1:
         root.after(200, lambda: app.process_file(sys.argv[1]))
     root.mainloop()

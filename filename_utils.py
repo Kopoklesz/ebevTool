@@ -37,13 +37,33 @@ def safe_folder_name(text):
     return re.sub(r'[<>:"/\\|?*]', '_', text).strip() or 'ismeretlen'
 
 
+# Az új NAV-export fájlneve: Egyszerusitett_<foglalkoztató adószáma>_<riportazonosító>
+NAV_EXPORT_RE = re.compile(r'^EGYSZERUSITETT_(\d{8})_\d+$')
+
+
+def tax_number(filename):
+    """A NAV-export fájlnevében szereplő foglalkoztatói adószám törzsszáma, vagy None."""
+    name = normalize(os.path.splitext(os.path.basename(filename))[0])
+    match = NAV_EXPORT_RE.match(name)
+    return match.group(1) if match else None
+
+
 def alias_token(filename):
-    """A fájlnév cégre utaló része: hónapnév és számok nélkül, normalizálva.
+    """A fájlnév cégre utaló része, normalizálva.
 
     Ez a token azonosítja a fájlnév-mintát az alias táblában, így pl. a
     'VALAMI JÚLIUS.xlsx' és 'VALAMI AUGUSZTUS 2.xlsx' ugyanahhoz a
     megjegyzett céghez tartozik.
+
+    Az új NAV-export fájlneve nem tartalmaz cégnevet, csak a foglalkoztató
+    adószámát ('Egyszerusitett_21916704_5017127242648694.xlsx') — itt az
+    adószám azonosítja a céget. Enélkül minden cég ugyanarra az
+    'EGYSZERUSITETT' tokenre esne össze.
     """
+    adoszam = tax_number(filename)
+    if adoszam:
+        return f'EGYSZERUSITETT_{adoszam}'
+
     name = normalize(os.path.splitext(os.path.basename(filename))[0])
     for month_name in MONTHS:
         name = name.replace(month_name, ' ')
