@@ -1787,8 +1787,9 @@ class App:
         ttk.Label(dlg, text='Ismeretlen személy', background=COLORS['card'], font=FONT_BOLD).pack()
         ttk.Label(dlg, text=f'{nev}  •  TAJ: {taj}', background=COLORS['card'],
                   foreground=COLORS['muted'], font=FONT_BASE).pack(pady=(2, 4))
-        ttk.Label(dlg, text='Add meg az adatait, vagy hagyd üresen és nyomj OK-t\n'
-                            '(ha üres, nem kerül az Excelbe és nem mentjük el).',
+        ttk.Label(dlg, text='Add meg az adatait, vagy hagyd üresen és nyomj OK-t.\n'
+                            'A személy üresen hagyva is bekerül a statisztikába, '
+                            'csak az adatlapja marad kitöltetlen.',
                   background=COLORS['card'], foreground=COLORS['muted'], font=FONT_BASE,
                   justify='center', wraplength=360).pack(padx=24, pady=(0, 12))
 
@@ -1811,9 +1812,11 @@ class App:
             vars_[key] = var
 
         def do_ok():
+            # Üresen hagyva is elfogadjuk: a személy így is bekerül a
+            # statisztikába, csak az adatlapja marad kitöltetlen. Az üres
+            # profilt is elmentjük, így legközelebb nem kérdez rá újra.
             values = {k: v.get().strip() for k, v in vars_.items()}
-            if any(values.values()):
-                result['data'] = {'taj': taj, 'nev': nev, **values}
+            result['data'] = {'taj': taj, 'nev': nev, **values}
             dlg.destroy()
 
         btns = ttk.Frame(dlg, style='Card.TFrame')
