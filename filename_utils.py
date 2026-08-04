@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import shutil
 import sys
 import unicodedata
 
@@ -10,10 +11,77 @@ MONTHS = {
     'SZEPTEMBER': 9, 'OKTOBER': 10, 'NOVEMBER': 11, 'DECEMBER': 12,
 }
 
+APP_NAME = 'ebevTool'
+
+
 def app_dir():
+    """A futtatható állomány (vagy forrásból futtatva a forrás) mappája.
+
+    FIGYELEM: ide nem írunk semmit — az .exe mellé kerülő fájlok
+    rendetlenséget okoznak, és a Program Files alatt írásjogunk sincs.
+    Az adatoknak a 'user_data_dir()' / 'documents_dir()' való.
+    """
     if getattr(sys, 'frozen', False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
+
+
+def user_data_dir():
+    """A felhasználó gépi beállításainak helye (rejtett alkalmazás-adat).
+
+    Windows: %APPDATA%\\ebevTool  (pl. C:\\Users\\<név>\\AppData\\Roaming\\ebevTool)
+    Ide kerül a config.dat és az aliases.json — olyan fájlok, amiket a
+    felhasználónak nem kell kézzel nyitogatnia.
+    """
+    base = os.environ.get('APPDATA')
+    if not base:
+        # Nem Windows vagy hiányzó környezeti változó — ilyenkor a
+        # felhasználói mappa rejtett almappája a bevett hely.
+        base = os.path.join(os.path.expanduser('~'), '.config')
+    path = os.path.join(base, APP_NAME)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def documents_dir():
+    """A felhasználó Dokumentumok mappája (átirányítást is figyelembe véve).
+
+    Ide kerül az archívum: azt a felhasználó meg akarja találni és böngészni,
+    ezért nem való rejtett alkalmazás-adatok közé.
+    """
+    if sys.platform == 'win32':
+        try:
+            import ctypes
+            import ctypes.wintypes
+            # A Dokumentumok mappa átirányítható (OneDrive, hálózati profil),
+            # ezért a rendszertől kérdezzük meg, nem tippelünk.
+            buf = ctypes.create_unicode_buffer(ctypes.wintypes.MAX_PATH)
+            CSIDL_PERSONAL, SHGFP_TYPE_CURRENT = 5, 0
+            if ctypes.windll.shell32.SHGetFolderPathW(
+                    None, CSIDL_PERSONAL, None, SHGFP_TYPE_CURRENT, buf) == 0 and buf.value:
+                return buf.value
+        except Exception:
+            pass
+    return os.path.join(os.path.expanduser('~'), 'Documents')
+
+
+def migrate_legacy_file(filename, target_dir):
+    """Egy régi, .exe mellé került fájl átmozgatása az új helyére.
+
+    A korábbi verziók az alkalmazás mappájába írtak. Frissítés után ezeket
+    egyszer átköltöztetjük, hogy a beállítások ne vesszenek el. Csendben
+    dolgozik: ha bármi hiba van, marad a régi állapot.
+    """
+    old_path = os.path.join(app_dir(), filename)
+    new_path = os.path.join(target_dir, filename)
+    if not os.path.exists(old_path) or os.path.exists(new_path):
+        return False
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+        shutil.move(old_path, new_path)
+        return True
+    except Exception:
+        return False
 
 
 def normalize(text):
@@ -72,7 +140,10 @@ def alias_token(filename):
 
 
 def _local_alias_path():
-    return os.path.join(app_dir(), 'aliases.json')
+    # A korábbi verziók az .exe mellé írtak; egyszeri átköltöztetés után az
+    # alias-cache a felhasználói adatmappában él.
+    migrate_legacy_file('aliases.json', user_data_dir())
+    return os.path.join(user_data_dir(), 'aliases.json')
 
 
 def load_local_aliases():

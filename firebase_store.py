@@ -18,9 +18,24 @@ RETENTION_MONTHS = 6
 # Firestore commit végpontonkénti írás-limit
 BATCH_LIMIT = 500
 
+# Egy Firestore dokumentum legfeljebb 1 MiB. A titkosított snapshot-payloadot
+# ennél kisebb szeletekre vágjuk, hogy a többi mező és a Firestore overhead is
+# biztosan elférjen mellette. A tipikus havi adag (50-200 fő) néhány tíz KB,
+# tehát egyetlen szelet — a darabolás csak a szélsőséges eseteket fogja meg.
+CHUNK_SIZE = 700_000
+
 
 class FirebaseError(Exception):
     pass
+
+
+class ConflictError(FirebaseError):
+    """Egy másik gép közben módosította ugyanazt az adatot.
+
+    A várakozási sor feldolgozása olvas -> dönt -> ír menetben zajlik. Ha a
+    kettő között valaki más felhasználta ugyanazokat a rekordokat, a feltételes
+    írás elbukik, és inkább hibát jelzünk, mint hogy csendben felülírjuk.
+    """
 
 
 def ym_today():
@@ -67,11 +82,32 @@ def _fields(d):
 def _parse_doc(doc):
     parsed = {k: _from_value(v) for k, v in doc.get('fields', {}).items()}
     parsed['_id'] = doc['name'].rsplit('/', 1)[1]
+    # A dokumentum verziója: ezzel tudjuk feltételessé tenni a későbbi írást,
+    # hogy egy közben történt módosítást ne írjunk felül észrevétlenül.
+    parsed['_update_time'] = doc.get('updateTime')
     return parsed
 
 
 def entry_doc_id(entry):
     return hashlib.sha256(entry_key(entry).encode('utf-8')).hexdigest()[:32]
+
+
+def _is_precondition_failure(response):
+    """Igaz, ha a válasz feltételes írás megsértését jelzi.
+
+    A Firestore ilyenkor 400-at ad FAILED_PRECONDITION státusszal. A JSON
+    szerkezetére nem támaszkodunk vakon: ha nem értelmezhető, a szövegre
+    esünk vissza.
+    """
+    if response.status_code not in (400, 409):
+        return False
+    try:
+        error = response.json().get('error', {})
+        if error.get('status') == 'FAILED_PRECONDITION':
+            return True
+    except Exception:
+        pass
+    return 'FAILED_PRECONDITION' in (response.text or '')
 
 
 class FirebaseStore:
@@ -163,15 +199,24 @@ class FirebaseStore:
             except Exception as e:
                 raise FirebaseError(f'Firestore commit hívás sikertelen: {e}') from e
             if not r.ok:
+                # A feltételes írás megsértését külön kezeljük: ilyenkor nem
+                # hiba történt, hanem valaki más módosította közben az adatot.
+                if _is_precondition_failure(r):
+                    raise ConflictError(
+                        'Egy másik gép közben módosította ugyanezeket a rekordokat.')
                 raise FirebaseError(f'Firestore commit hiba ({r.status_code}): {r.text[:300]}')
 
     def _delete_write(self, path):
         return {'delete': f'{self.doc_root}/{path}'}
 
-    def _update_write(self, path, fields, mask=None):
+    def _update_write(self, path, fields, mask=None, if_unchanged_since=None):
+        """Írás-művelet. Az 'if_unchanged_since' a dokumentum ismert verziója:
+        ha megadjuk, a Firestore csak akkor írja felül, ha azóta nem változott."""
         write = {'update': {'name': f'{self.doc_root}/{path}', 'fields': _fields(fields)}}
         if mask is not None:
             write['updateMask'] = {'fieldPaths': mask}
+        if if_unchanged_since:
+            write['currentDocument'] = {'updateTime': if_unchanged_since}
         return write
 
     # --- titkosítás ---
@@ -211,10 +256,26 @@ class FirebaseStore:
                 'status': doc.get('status', 'pending'),
                 'consumed_in': doc.get('consumed_in'),
                 'entry': entry,
+                # A beolvasáskori verzió: a feldolgozás végén ezzel tesszük
+                # feltételessé az írást (lásd sync_processing).
+                'version': doc.get('_update_time'),
             })
         return records
 
-    def sync_processing(self, company, upsert_entries, consume_ids, ym, filename):
+    def sync_processing(self, company, upsert_entries, consume_ids, ym, filename,
+                        history_extra=None, history_id=None):
+        """A várakozási sor frissítése és egy előzmény-rekord létrehozása.
+
+        A 'consume_ids' elemei lehetnek sima azonosítók, vagy (id, verzió)
+        párok. Verzióval megadva az írás feltételes lesz: ha a rekordot a
+        beolvasásunk óta más módosította (pl. már felhasználta), a commit
+        ConflictError-ral elbukik ahelyett, hogy csendben felülírná.
+
+        A 'history_extra' opcionális mezőkkel (pl. snapshot_id, created_by)
+        egészíti ki az előzmény-dokumentumot. A 'history_id' megadható kívülről,
+        hogy a hozzá tartozó snapshot ugyanazt az azonosítót kapja; enélkül
+        újat generálunk. Visszaadja a használt azonosítót.
+        """
         upsert_paths = [f'companies/{company}/memory/{entry_doc_id(e)}' for e in upsert_entries]
         existing = self._batch_get(upsert_paths)
 
@@ -230,18 +291,22 @@ class FirebaseStore:
                     'consumed_in': None, 'created_at': _now_iso(), 'updated_at': _now_iso(),
                 }))
 
-        for doc_id in consume_ids:
+        for item in consume_ids:
+            doc_id, version = item if isinstance(item, (tuple, list)) else (item, None)
             writes.append(self._update_write(
                 f'companies/{company}/memory/{doc_id}',
                 {'status': 'consumed', 'consumed_in': ym, 'updated_at': _now_iso()},
-                mask=['status', 'consumed_in', 'updated_at']))
+                mask=['status', 'consumed_in', 'updated_at'],
+                if_unchanged_since=version))
 
-        history_id = uuid.uuid4().hex[:24]
+        history_id = history_id or uuid.uuid4().hex[:24]
+        history_fields = {'filename': filename, 'year_month': ym, 'processed_at': _now_iso()}
+        history_fields.update(history_extra or {})
         writes.append(self._update_write(
-            f'companies/{company}/history/{history_id}',
-            {'filename': filename, 'year_month': ym, 'processed_at': _now_iso()}))
+            f'companies/{company}/history/{history_id}', history_fields))
 
         self._commit(writes)
+        return history_id
 
     def delete_record(self, company, doc_id):
         self._request('DELETE', f'companies/{company}/memory/{doc_id}')
@@ -253,6 +318,8 @@ class FirebaseStore:
     def delete_all_history(self, company):
         docs = self._list(f'companies/{company}/history')
         self._commit([self._delete_write(f'companies/{company}/history/{d["_id"]}') for d in docs])
+        # A snapshotok az előzményekhez tartoznak — nélkülük árván maradnának.
+        self.delete_all_snapshots(company)
 
     def delete_all_aliases(self, company):
         docs = self._list('company_aliases')
@@ -271,6 +338,62 @@ class FirebaseStore:
 
     def load_history(self, company):
         return self._list(f'companies/{company}/history')
+
+    # --- snapshotok (a kimenet újragenerálásához szükséges tartalom) ---
+    #
+    # Nem a kész munkafüzetet tároljuk, hanem a bemeneteit: a 'generate_output'
+    # determinisztikus, így letöltéskor ugyanaz a fájl állítható elő belőle.
+    # A payload titkosítva megy fel, mert a teljes forrásadatot tartalmazza.
+
+    def save_snapshot(self, company, snapshot_id, payload, meta):
+        raw = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+        token = self.fernet.encrypt(raw).decode('ascii')
+        chunks = [token[i:i + CHUNK_SIZE] for i in range(0, len(token), CHUNK_SIZE)] or ['']
+
+        base = f'companies/{company}/snapshots/{snapshot_id}'
+        fields = dict(meta)
+        fields['chunk_count'] = len(chunks)
+        fields['created_at'] = _now_iso()
+        # Egy szeletnél a payload a fődokumentumban marad: a tipikus eset így
+        # egyetlen dokumentum, egyetlen olvasás.
+        fields['payload'] = chunks[0] if len(chunks) == 1 else None
+
+        writes = [self._update_write(base, fields)]
+        if len(chunks) > 1:
+            for i, chunk in enumerate(chunks):
+                writes.append(self._update_write(f'{base}/parts/{i}', {'payload': chunk}))
+        self._commit(writes)
+
+    def load_snapshot(self, company, snapshot_id):
+        base = f'companies/{company}/snapshots/{snapshot_id}'
+        doc = self._request('GET', base)
+        if not doc:
+            return None
+        parsed = _parse_doc(doc)
+
+        if (parsed.get('chunk_count') or 1) > 1:
+            parts = self._list(f'{base}/parts')
+            # A dokumentumnevek stringként rendeződnek, ezért számként rendezzük.
+            parts.sort(key=lambda d: int(d['_id']))
+            token = ''.join(p.get('payload') or '' for p in parts)
+        else:
+            token = parsed.get('payload') or ''
+        if not token:
+            return None
+
+        payload = json.loads(self.fernet.decrypt(token.encode('ascii')))
+        return {'payload': payload, 'meta': parsed}
+
+    def delete_snapshot(self, company, snapshot_id):
+        base = f'companies/{company}/snapshots/{snapshot_id}'
+        writes = [self._delete_write(f'{base}/parts/{d["_id"]}')
+                  for d in self._list(f'{base}/parts')]
+        writes.append(self._delete_write(base))
+        self._commit(writes)
+
+    def delete_all_snapshots(self, company):
+        for doc in self._list(f'companies/{company}/snapshots'):
+            self.delete_snapshot(company, doc['_id'])
 
     # --- cég-aliasok ---
 

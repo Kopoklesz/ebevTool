@@ -1,3 +1,4 @@
+import hashlib
 from datetime import datetime, timedelta
 
 from openpyxl import Workbook, load_workbook
@@ -275,6 +276,108 @@ def merge_entries(current_entries, carried_entries):
             seen.add(entry_key(e))
             merged.append(e)
     return merged
+
+
+# --- snapshot szerializáció ---
+#
+# A kész munkafüzetet nem tároljuk: a 'generate_output' determinisztikus, ezért
+# elég a bemeneteit (header, data_rows, entries, fmt) elmenteni, és letöltéskor
+# újragenerálni. Az alábbi függvények ezt a JSON-ra alakítást végzik.
+
+def format_by_key(key):
+    """Az InputFormat visszakeresése a kulcsa alapján (ismeretlennél az alap)."""
+    for fmt in FORMATS:
+        if fmt.key == key:
+            return fmt
+    return DEFAULT_FORMAT
+
+
+def _cell_to_json(value):
+    """Egy cellaérték JSON-ra alakítása.
+
+    Az openpyxl dátumcellát datetime-ként adja vissza, amit a JSON nem ismer,
+    ezért jelölt objektummá alakítjuk. Minden más nem-primitív típusból string
+    lesz — a kimenetben úgyis szövegként jelenne meg.
+    """
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, datetime):
+        return {'__dt__': value.isoformat()}
+    return str(value)
+
+
+def _cell_from_json(value):
+    if isinstance(value, dict) and '__dt__' in value:
+        return datetime.fromisoformat(value['__dt__'])
+    return value
+
+
+def rows_to_json(rows):
+    return [[_cell_to_json(c) for c in row] for row in rows]
+
+
+def rows_from_json(rows):
+    return [tuple(_cell_from_json(c) for c in row) for row in rows]
+
+
+def entries_to_json(entries):
+    """A bejegyzések ISO dátummal — a serial az EPOCH-tól függ, az ISO nem."""
+    return [{
+        'nev': e['nev'],
+        'adoazonosito': e['adoazonosito'],
+        'taj': e['taj'],
+        'start_date': serial_to_iso(e['start_serial']),
+        'munkanapok': e['munkanapok'],
+    } for e in entries]
+
+
+def entries_from_json(items):
+    return [{
+        'nev': i['nev'],
+        'adoazonosito': i['adoazonosito'],
+        'taj': i['taj'],
+        'start_serial': iso_to_serial(i['start_date']),
+        'munkanapok': i['munkanapok'],
+    } for i in items]
+
+
+def build_snapshot(header, data_rows, entries, fmt):
+    """A 'generate_output' bemeneteiből JSON-ra alakítható snapshot."""
+    return {
+        'v': 1,
+        'fmt': fmt.key,
+        'header': [_cell_to_json(c) for c in (header or [])],
+        'data_rows': rows_to_json(data_rows),
+        'entries': entries_to_json(entries),
+    }
+
+
+def snapshot_to_args(snapshot):
+    """A snapshotból a 'generate_output' hívásához szükséges értékek."""
+    header = tuple(_cell_from_json(c) for c in snapshot.get('header') or [])
+    return {
+        'header': header,
+        'data_rows': rows_from_json(snapshot.get('data_rows') or []),
+        'entries': entries_from_json(snapshot.get('entries') or []),
+        'fmt': format_by_key(snapshot.get('fmt')),
+    }
+
+
+def content_hash(path):
+    """A munkafüzet tartalmának ujjlenyomata (a metaadatok nélkül).
+
+    A nyers fájl-hash erre nem alkalmas: az openpyxl a létrehozás idejét is
+    beleírja a 'docProps/core.xml'-be, így két egyébként azonos generálás
+    fájlszinten mindig eltér. Itt csak a munkalapok cellaértékeit hasheljük.
+    """
+    wb = load_workbook(path)
+    h = hashlib.sha256()
+    for name in wb.sheetnames:
+        h.update(name.encode('utf-8'))
+        for row in wb[name].values:
+            h.update(repr(row).encode('utf-8'))
+    wb.close()
+    return h.hexdigest()
 
 
 def generate_output(input_path, header, data_rows, entries, output_path=None,

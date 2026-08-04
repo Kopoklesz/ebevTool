@@ -40,14 +40,27 @@ szereplő **foglalkoztatói adószám** alapján történik.
   (`consumed`) rekordok fél évig megmaradnak, így egy hónap **újrafeldolgozása**
   ugyanazt a kimenetet adja; utána automatikusan törlődnek.
 - **Előzmények** nézet: mely fájlok lettek már feldolgozva (cégenként,
-  év-hónap szerint; csak fájlnév + időpont, tartalom nélkül).
+  év-hónap szerint), ki készítette, és a korábbi statisztikák **letöltése**
+  bármelyik gépről (lásd lent).
+- **Ütközésvédelem** két szinten, ha többen használják ugyanazt az adatbázist:
+  - *előre*: ha egy cég adott hónapja már szerepel az előzményekben, a
+    feldolgozás rákérdez, mielőtt új verziót készítene;
+  - *írás közben*: a várakozási sor rekordjait a program csak akkor jelöli
+    felhasználtnak, ha azok a beolvasás óta nem változtak. Ha közben valaki
+    más feldolgozta ugyanazt, a mentés megszakad, és **a másik gép munkája
+    ép marad** — semmi nem íródik felül csendben.
 - **Várakozási sor / Böngésző** nézet: a Firestore-ban tárolt rekordok
   dekódolt böngészése és manuális törlése.
 - **Személyek** nézet: TAJ-hoz kötött, titkosítva tárolt személyi adatok
   (szül. név, anyja neve, szül. hely/idő, lakcím). Ismeretlen TAJ-nál a
   feldolgozás rákérdez, és a `Név Szerint` lap adatlapjait ezekből tölti ki.
 - **Helyi archívum**: a kimeneti fájl másolata automatikusan a
-  `archívum/<Cég>/<év-hónap>/` mappába kerül, így később is visszakereshető.
+  `Dokumentumok/ebevTool archívum/<Cég>/<év-hónap>/` mappába kerül, így később
+  is visszakereshető (a hely a Beállításokban átírható).
+- **Központi visszakeresés**: a statisztika *tartalma* (a forrássorok és a
+  bejegyzések, titkosítva) a Firestore-ba is felkerül, így az Előzmények
+  nézetből **bárki letöltheti**, aki hozzáfér az adatbázishoz — nem csak az,
+  aki annak idején feldolgozta.
 - **Automatikus frissítés**: az alkalmazás induláskor csendben megnézi, van-e
   újabb kiadás a GitHubon, és a 🔄 **Frissítés** menüpontban egy kattintással
   letölthető és telepíthető (lásd lent).
@@ -64,6 +77,33 @@ szereplő **foglalkoztatói adószám** alapján történik.
 A kimenet a bemeneti fájl mellé kerül `<fájlnév>_statisztika.xlsx` néven,
 plusz egy másolat az archívum mappába.
 
+## Korábbi statisztikák letöltése
+
+Az **Előzmények** nézetben minden feldolgozott fájl mellett látszik, hogy ki és
+mikor készítette, és hogy letölthető-e (`✓`). A sort kijelölve a
+**⬇ Kijelölt letöltése** gomb újraépíti a statisztikát, tetszőleges helyre.
+
+Nem a kész munkafüzetet tároljuk, hanem a **tartalmát**: a forrássorokat és a
+bejegyzéseket. A statisztika előállítása determinisztikus, ezért ugyanabból a
+tartalomból ugyanaz a fájl épül újra. Ennek több előnye van:
+
+- töredék helyet foglal (egy tipikus hónap néhány tíz KB a több száz KB-os
+  munkafüzet helyett), így simán elfér a Firestore-ban — nem kell fájltároló;
+- a tartalom titkosítva utazik és tárolódik, ugyanazzal a kulccsal, mint a
+  várakozási sor;
+- ha a program egy későbbi verziója javít a statisztikán, a **régi hónapok is
+  a javított formában** jönnek le.
+
+Ez utóbbinak van egy következménye: ha a generálás időközben megváltozott, a
+letöltött fájl eltérhet attól, amit annak idején beadtak. A program ezt észreveszi
+(a mentett verziószám és tartalom-ujjlenyomat alapján), és jelzi a naplóban.
+**Ha bitazonos megőrzésre van szükség, arra továbbra is a helyi archívum való** —
+az érintetlenül megmarad.
+
+A funkció bevezetése előtt feldolgozott hónapoknál a `Letölthető` oszlopban `—`
+áll: azokhoz nincs mentett tartalom. Ha egy ilyen hónap központilag is kell, az
+eredeti bemeneti fájlt újra fel kell dolgozni.
+
 ## Használat
 
 (Build nélkül) Indítsd el a GUI-t, és húzd be / tallózd be az Excel fájlt:
@@ -74,6 +114,30 @@ python gui.py
 
 Vagy húzd rá a fájlt a `Statisztika_generálás.bat`-ra — ez a GUI-t az
 előre kitöltött fájllal indítja, és rögtön feldolgozza.
+
+## Hol tárolja az adatait
+
+Az `.exe` mellé **semmit nem ír** — így a program mappája tiszta marad, és
+akkor is működik, ha csak olvasható helyre (pl. `Program Files`) telepítik.
+
+| Mi | Hol |
+|---|---|
+| Beállítások (`config.dat`) | `%APPDATA%\ebevTool\` |
+| Cégnév-gyorsítótár (`aliases.json`) | `%APPDATA%\ebevTool\` |
+| Archívum (kész statisztikák) | `Dokumentumok\ebevTool archívum\` |
+| Frissítés ideiglenes fájljai | a rendszer `TEMP` mappája |
+
+A pontos útvonalak a **⚙ Beállítások** ablak alján is látszanak, a mappákat
+onnan egy kattintással meg lehet nyitni.
+
+> **Frissítéskor a régi fájlok automatikusan átkerülnek.** A korábbi verziók az
+> `.exe` mellé írtak; az első indításkor a `config.dat` és az `aliases.json`
+> átköltözik az új helyre, beállítások elvesztése nélkül.
+>
+> Az **archívum mappát nem mozgatjuk** (nagy lehet): ha az `.exe` mellett már
+> létezik `archívum` mappa, a program továbbra is azt használja, így a meglévő
+> gyűjtemény nem szakad ketté. Ha át szeretnéd helyezni, mozgasd át kézzel, és
+> add meg az új helyet a Beállításokban.
 
 ## Telepítés
 
@@ -118,6 +182,26 @@ magát, és újraindul az új verzióval.
 > `.exe`-t egyszer kézzel kell kicserélni. Az onnantól kiadott verziók már
 > automatikusan frissülnek.
 
+### Ha a frissítés nem sikerül
+
+- **„Nincs írásjog"**: az `.exe` olyan mappában van (tipikusan
+  `Program Files`), ahová a felhasználó nem írhat. A program ezt a letöltés
+  *előtt* jelzi. Megoldás: indítsd rendszergazdaként, vagy tedd az `.exe`-t
+  olyan mappába, ahová írhatsz.
+- **„Nincs Python a gépen" vagy hasonló furcsa hiba indításkor**: ez nem a
+  program hibája — a `Statisztika_generálás.bat` nem találja az `.exe`-t
+  (pl. mert egy korábbi csere félbemaradt), és a Windows próbálja másként
+  értelmezni a fájlt. A `.bat` ezt ma már felismeri és megnevezi a hiányzó
+  fájlt. Megoldás: töltsd le újra a legfrissebb kiadást.
+- **Ékezetes felhasználónév**: a csere rövid (8.3-as) útvonalakkal dolgozik,
+  ezért ékezetes mappanévvel is működik. Ha egy gépen ki van kapcsolva a
+  8.3-as névgenerálás *és* ékezetes az útvonal, a csere elbukhat — ilyenkor a
+  kézi csere segít.
+
+A cserét egy ideiglenes batch végzi, ami megvárja, míg a futó példány kilép.
+Ha a csere nem sikerül, **az eredeti `.exe` visszaáll** — a program nem marad
+működésképtelen állapotban.
+
 Új verzió kiadásának lépései:
 
 1. Írd át a verziószámot a [`version.py`](version.py) fájlban:
@@ -144,8 +228,16 @@ kiadási oldal megnyitását — kézzel akkor is frissíthető. Forrásból fut
 
 ## Megjegyzés
 
-Firebase-beállítások (`config.dat`) a felhasználó gépén titkosítva
-tárolódnak — az adott Windows-fiókhoz és géphez kötve, más gépre
-vagy fiókba átmásolva olvashatatlanok, és csak a Beállítások ablakon
-keresztül szerkeszthetők. A Firestore-ban csak az ideiglenes várakozási sor
-adatai tárolódnak, titkosítva és korlátozott (max. fél éves) megőrzéssel.
+Firebase-beállítások (`config.dat`, a `%APPDATA%\ebevTool\` mappában) a
+felhasználó gépén titkosítva tárolódnak — az adott Windows-fiókhoz és géphez
+kötve, más gépre vagy fiókba átmásolva olvashatatlanok, és csak a Beállítások
+ablakon keresztül szerkeszthetők.
+
+A Firestore-ban a **várakozási sor** (titkosítva, max. fél éves megőrzéssel), a
+**személyi adatlapok** (titkosítva, TAJ-hoz kötve) és a feldolgozott hónapok
+**statisztika-tartalma** (titkosítva) tárolódik. Mindhármat ugyanaz a Fernet
+kulcs védi — ha ez elvész, az adatok visszafejthetetlenné válnak.
+
+> **Figyelem:** a Firebase-bejelentkezés anonim, ezért aki hozzáfér a Web API
+> kulcshoz *és* a Fernet kulcshoz, az minden cég adatát eléri. Ha több ügyfél
+> adatait kezelitek, érdemes valódi felhasználókezelésre váltani.

@@ -1,8 +1,11 @@
+import getpass
 import json
 import os
+import platform
 import shutil
 import sys
 import threading
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
@@ -40,17 +43,26 @@ import filename_utils
 import dpapi_crypto
 import updater
 from dpapi_crypto import DPAPIError
-from firebase_store import FirebaseError, FirebaseStore, months_between, ym_today
+from firebase_store import (ConflictError, FirebaseError, FirebaseStore,
+                            months_between, ym_today)
 from version import RELEASES_PAGE, __version__
 
 CONFIG_FIELDS = ('FIREBASE_API_KEY', 'FIREBASE_PROJECT_ID', 'FERNET_KEY', 'ARCHIVE_DIR')
 
 
 def config_path():
-    return os.path.join(filename_utils.app_dir(), 'config.dat')
+    # A korábbi verziók az .exe mellé írtak; egyszeri átköltöztetés után a
+    # titkosított beállítás a felhasználói adatmappában él.
+    filename_utils.migrate_legacy_file('config.dat', filename_utils.user_data_dir())
+    return os.path.join(filename_utils.user_data_dir(), 'config.dat')
 
 
 def _legacy_config_py_path():
+    """A régi, olvasható config.py — forrásból futtatva még használatban lehet."""
+    for folder in (filename_utils.user_data_dir(), filename_utils.app_dir()):
+        path = os.path.join(folder, 'config.py')
+        if os.path.exists(path):
+            return path
     return os.path.join(filename_utils.app_dir(), 'config.py')
 
 
@@ -121,8 +133,41 @@ FIREBASE_CONSOLE_URL = 'https://console.firebase.google.com/'
 
 
 def default_archive_dir():
+    """A kimeneti fájlok archívuma.
+
+    Alapból a Dokumentumok alá kerül: ezeket a felhasználó meg akarja találni
+    és megnyitni, ezért nem való rejtett alkalmazás-adatok közé — és végképp
+    nem az .exe mellé.
+
+    A korábbi verziók az .exe mellé archiváltak. Az ott lévő mappát nem
+    mozgatjuk (nagy lehet, és lehet rá hivatkozás), de ha létezik és a
+    Beállításokban nincs megadva más, továbbra is azt használjuk — így a
+    frissítés nem szakítja ketté a meglévő archívumot.
+    """
     configured = getattr(config, 'ARCHIVE_DIR', None) if config else None
-    return configured or os.path.join(filename_utils.app_dir(), 'archívum')
+    if configured:
+        return configured
+    legacy = os.path.join(filename_utils.app_dir(), 'archívum')
+    if os.path.isdir(legacy):
+        return legacy
+    return os.path.join(filename_utils.documents_dir(), 'ebevTool archívum')
+
+
+def machine_label():
+    """Felhasználó/gép azonosító a 'ki dolgozta fel' jelzéshez.
+
+    Nem hitelesített adat (a Firebase-bejelentkezés anonim) — csak arra jó,
+    hogy a figyelmeztetésben emberi név szerepeljen.
+    """
+    try:
+        user = getpass.getuser()
+    except Exception:
+        user = '?'
+    try:
+        host = platform.node() or '?'
+    except Exception:
+        host = '?'
+    return f'{user} / {host}'
 
 
 # --- vizuális stílus ---
@@ -540,6 +585,9 @@ class App:
     def _open_path(self, path):
         target = path if os.path.isdir(path) else os.path.dirname(path)
         try:
+            # Az archívum csak az első feldolgozáskor jön létre; a Beállításokból
+            # viszont már előtte is megnyithatónak kell lennie.
+            os.makedirs(target, exist_ok=True)
             os.startfile(target)
         except Exception as e:
             messagebox.showerror('Hiba', f'Nem sikerült megnyitni:\n{e}')
@@ -665,28 +713,70 @@ class App:
         if ctx is None:
             return
 
-        if self._persons is not None:
-            self._process_file_check_persons(ctx)
-        else:
-            self.run_async(
-                self._load_persons_work,
-                lambda persons, error: self._on_persons_loaded_for_file(persons, error, ctx),
-                'Személyek betöltése...')
+        # A személyeket és az előzményeket egy menetben töltjük: háttérszálon
+        # nem nyitható dialógus, ezért minden Firestore-olvasás ide kerül, és a
+        # kérdések a főszálon futó callbackben jelennek meg.
+        self.run_async(
+            lambda: self._load_context_work(ctx),
+            lambda loaded, error: self._on_context_loaded(loaded, error, ctx),
+            'Adatok betöltése...')
 
-    def _load_persons_work(self):
+    def _load_context_work(self, ctx):
+        """Személyek (ha még nincsenek) és a cég adott havi előzményei."""
+        result = {'persons': None, 'history': []}
         if not self.store:
-            return {}
+            return result
         online, _ = self._try_sign_in()
         if not online:
-            return {}
+            return result
+        if self._persons is None:
+            try:
+                result['persons'] = self.store.load_persons()
+            except Exception:
+                result['persons'] = {}
         try:
-            return self.store.load_persons()
+            result['history'] = [
+                row for row in self.store.load_history(ctx['company'])
+                if row.get('year_month') == ctx['ym']]
         except Exception:
-            return {}
+            result['history'] = []
+        return result
 
-    def _on_persons_loaded_for_file(self, persons, error, ctx):
-        self._persons = persons or {}
+    def _on_context_loaded(self, loaded, error, ctx):
+        if loaded and loaded.get('persons') is not None:
+            self._persons = loaded['persons']
+        if self._persons is None:
+            self._persons = {}
+
+        previous = (loaded or {}).get('history') or []
+        if previous and not self._confirm_reprocess(ctx, previous):
+            self.log('Megszakítva: ezt a hónapot már feldolgozták.')
+            return
+
         self._process_file_check_persons(ctx)
+
+    def _confirm_reprocess(self, ctx, previous):
+        """Figyelmeztetés, ha a cég adott hónapja már fel lett dolgozva.
+
+        Nem zárolás: ha ketten pontosan egyszerre indítanak, mindkettő átcsúszhat.
+        A gyakorlati esetet (valaki ma, valaki holnap) viszont megfogja.
+        """
+        latest = max(previous, key=lambda r: r.get('processed_at') or '')
+        when = (latest.get('processed_at') or '')[:19].replace('T', ' ')
+        who = latest.get('created_by')
+
+        lines = [f"Cég:\t{ctx['company']}", f"Hónap:\t{ctx['ym']}",
+                 f"Készült:\t{when}" + (f'  ({who})' if who else '')]
+        if len(previous) > 1:
+            lines.append(f'Korábbi feldolgozások száma: {len(previous)}')
+
+        return messagebox.askokcancel(
+            'Ezt a hónapot már feldolgozták',
+            'Ez a cég-hónap már szerepel az előzményekben:\n\n'
+            + '\n'.join(lines)
+            + '\n\nHa folytatod, új verzió készül — a korábbi megmarad.\n'
+              'Folytatod a feldolgozást?',
+            icon='warning')
 
     def _process_file_check_persons(self, ctx):
         all_entries = ctx['current_entries'] + ctx['future_entries']
@@ -814,7 +904,9 @@ class App:
                 generate.serial_to_month_serial(rec['entry']['start_serial']))
             if rec['status'] == 'pending' and entry_ym <= ctx['ym']:
                 carried.append(rec['entry'])
-                to_consume.append(rec['id'])
+                # A beolvasáskori verzióval együtt: így az írás feltételes lesz,
+                # és kiderül, ha közben más felhasználta ugyanezt a rekordot.
+                to_consume.append((rec['id'], rec.get('version')))
             elif rec['status'] == 'consumed' and rec['consumed_in'] == ctx['ym']:
                 carried.append(rec['entry'])
 
@@ -845,20 +937,62 @@ class App:
             logs.append(('text', f'Az archiválás nem sikerült: {e}'))
 
         firestore_warning = None
+        conflict = False
         if online:
             try:
+                history_extra = {'created_by': machine_label(), 'snapshot_id': None}
+                snapshot = generate.build_snapshot(
+                    ctx['header'], ctx['data_rows'], entries, ctx['format'])
+                snapshot_meta = {
+                    'year_month': ctx['ym'],
+                    'filename': ctx['filename'],
+                    'app_version': __version__,
+                    'created_by': machine_label(),
+                    'entry_count': len(entries),
+                    'row_count': len(ctx['data_rows']),
+                    'content_hash': generate.content_hash(output_file),
+                }
+                history_id = uuid.uuid4().hex[:24]
+                # A snapshot előbb megy fel: ha elbukik, a history rekord
+                # snapshot_id nélkül jön létre, és nem hivatkozik nemlétezőre.
+                try:
+                    self.store.save_snapshot(ctx['company'], history_id, snapshot, snapshot_meta)
+                    history_extra['snapshot_id'] = history_id
+                    logs.append(('text', 'A statisztika tartalma elmentve — bármelyik gépről '
+                                         'letölthető az Előzményekből.'))
+                except Exception as e:
+                    logs.append(('text', f'A tartalom mentése nem sikerült (a fájl elkészült): {e}'))
+
                 self.store.sync_processing(ctx['company'], ctx['future_entries'], to_consume,
-                                           ctx['ym'], ctx['filename'])
+                                           ctx['ym'], ctx['filename'],
+                                           history_extra=history_extra,
+                                           history_id=history_id)
                 deleted = self.store.cleanup_expired(ctx['company'])
                 if deleted:
                     logs.append(('text', f'Takarítás: {deleted} lejárt rekord véglegesen törölve.'))
                 logs.append(('text', f"Várakozási sor frissítve ({len(ctx['future_entries'])} mentve, "
                                      f"{len(to_consume)} felhasználva)."))
+            except ConflictError:
+                # Valaki más ugyanezeket a rekordokat közben felhasználta. A
+                # várakozási sor érintetlen maradt (a commit atomikus), így a
+                # helyzet tiszta: a fájl elkészült, de nem "könyveltük el".
+                conflict = True
+                logs.append(('text', 'ÜTKÖZÉS: közben valaki más is feldolgozta ezt a hónapot. '
+                                     'A várakozási sor NEM módosult, a statisztika viszont '
+                                     'elkészült — ellenőrizd, melyik verzió a helyes.'))
+                if history_extra.get('snapshot_id'):
+                    # Az árván maradt snapshotot takarítjuk: nincs history
+                    # rekord, ami hivatkozna rá, így soha nem lenne elérhető.
+                    try:
+                        self.store.delete_snapshot(ctx['company'], history_extra['snapshot_id'])
+                    except Exception:
+                        pass
             except FirebaseError as e:
                 firestore_warning = str(e)
                 logs.append(('text', f'Firestore írás sikertelen: {e}'))
 
-        return {'logs': logs, 'no_connection': no_connection, 'firestore_warning': firestore_warning}
+        return {'logs': logs, 'no_connection': no_connection,
+                'firestore_warning': firestore_warning, 'conflict': conflict}
 
     def _process_file_finish(self, ctx, result, error):
         if error:
@@ -870,6 +1004,19 @@ class App:
                 self.log(item[1])
             else:
                 self.log_link(item[1], item[2])
+        if result.get('conflict'):
+            messagebox.showwarning(
+                'Ütközés — egyszerre ketten dolgoztátok fel',
+                'Amíg ez a feldolgozás futott, valaki más ugyanezeket a '
+                'rekordokat felhasználta.\n\n'
+                'A statisztika elkészült és archiválva lett, de a várakozási '
+                'sort NEM módosítottuk — így a másik gép munkája ép maradt, és '
+                'az átvitt dolgozók nem vesztek el.\n\n'
+                'Mit tegyél: egyeztess a kollégával, melyik verzió a helyes. '
+                'Ha a tiéd, futtasd le újra a feldolgozást — akkor a friss '
+                'állapotból dolgozik.')
+            return
+
         if result.get('no_connection'):
             messagebox.showwarning(
                 'Nincs kapcsolat',
@@ -916,10 +1063,16 @@ class App:
             self._render_page_message(page, 'Még nincs egyetlen ismert cég sem.')
             return
         self._clear_body(page)
-        frames, _, _ = self._build_company_switcher(page.body, companies)
+        self.history_state = {'trees': {}, 'rows': {}}
+
+        frames, _, switcher_state = self._build_company_switcher(page.body, companies)
+        self.history_state['switcher_state'] = switcher_state
+        cols = {'#0': ('Év-hónap / fájlnév', 280), 'processed': ('Feldolgozva', 150),
+                'by': ('Készítette', 150), 'saved': ('Letölthető', 90)}
         for company in companies:
-            tree = self._make_tree(frames[company], ('processed',),
-                                   {'#0': ('Év-hónap / fájlnév', 300), 'processed': ('Feldolgozva', 200)})
+            tree = self._make_tree(frames[company], ('processed', 'by', 'saved'), cols)
+            self.history_state['trees'][company] = tree
+            rows = self.history_state['rows'].setdefault(company, {})
             groups = {}
             for row in data[company]:
                 groups.setdefault(row.get('year_month', '?'), []).append(row)
@@ -928,7 +1081,100 @@ class App:
                                    tags=('odd' if i % 2 else 'even',))
                 for row in sorted(groups[ym], key=lambda r: r.get('processed_at', '')):
                     processed = (row.get('processed_at') or '')[:19].replace('T', ' ')
-                    tree.insert(node, 'end', text=row.get('filename', '?'), values=(processed,))
+                    # A régi rekordokban nincs snapshot_id — azokhoz nincs tartalom.
+                    has_snapshot = bool(row.get('snapshot_id'))
+                    rows[row['_id']] = row
+                    tree.insert(node, 'end', iid=row['_id'], text=row.get('filename', '?'),
+                                values=(processed, row.get('created_by') or '—',
+                                        '✓' if has_snapshot else '—'))
+
+        btns = ttk.Frame(page.body)
+        btns.pack(fill='x', pady=(10, 0))
+        ttk.Button(btns, text='⬇  Kijelölt letöltése', style='Secondary.TButton',
+                   command=self._download_selected_history).pack(side='left')
+        ttk.Button(btns, text='🔄  Frissítés', style='Secondary.TButton',
+                   command=self.show_history).pack(side='left', padx=8)
+
+    def _download_selected_history(self):
+        state = getattr(self, 'history_state', None)
+        if not state or 'switcher_state' not in state:
+            return
+        company = state['switcher_state'].get('active')
+        tree = state['trees'].get(company)
+        if not tree:
+            return
+        # Csak a levélelemek (fájlok) érdekesek, az év-hónap csoportok nem.
+        selected = [i for i in tree.selection() if i in state['rows'].get(company, {})]
+        if not selected:
+            messagebox.showinfo('Letöltés', 'Jelölj ki egy feldolgozott fájlt a listában.')
+            return
+        if len(selected) > 1:
+            messagebox.showinfo('Letöltés', 'Egyszerre egy fájl tölthető le.')
+            return
+
+        row = state['rows'][company][selected[0]]
+        snapshot_id = row.get('snapshot_id')
+        if not snapshot_id:
+            messagebox.showinfo(
+                'Nincs mentett tartalom',
+                'Ehhez a bejegyzéshez nincs elmentve a statisztika tartalma.\n\n'
+                'A régebbi feldolgozások még csak a helyi archívumban érhetők el — '
+                'a hónap újrafeldolgozásával utólag felkerül.')
+            return
+
+        suggested = os.path.splitext(row.get('filename') or 'statisztika')[0] + '_statisztika.xlsx'
+        dest = filedialog.asksaveasfilename(
+            title='Statisztika mentése', defaultextension='.xlsx',
+            initialfile=suggested, filetypes=[('Excel fájlok', '*.xlsx')])
+        if not dest:
+            return
+
+        def work():
+            loaded = self.store.load_snapshot(company, snapshot_id)
+            if not loaded:
+                return {'ok': False, 'reason': 'A mentett tartalom nem található.'}
+            args = generate.snapshot_to_args(loaded['payload'])
+            # A személyi adatlapokat a jelenlegi állapotból töltjük: a snapshot
+            # szándékosan nem duplikálja a 'persons' kollekciót.
+            try:
+                persons = self.store.load_persons()
+            except Exception:
+                persons = {}
+            # output_path megadva, ezért az első paraméter (input_path) nem
+            # számít — a névképzéshez használná, amit itt a felhasználó ad meg.
+            generate.generate_output(
+                None, args['header'], args['data_rows'], args['entries'],
+                output_path=dest, fmt=args['fmt'], persons=persons)
+            return {'ok': True, 'meta': loaded['meta'], 'path': dest}
+
+        self.run_async(work, self._on_history_downloaded, 'Statisztika újraépítése...')
+
+    def _on_history_downloaded(self, result, error):
+        if error:
+            self.log(f'HIBA a letöltésnél: {error}')
+            messagebox.showerror('Hiba', f'A letöltés nem sikerült:\n{error}')
+            return
+        if not result['ok']:
+            messagebox.showwarning('Letöltés', result['reason'])
+            return
+
+        meta = result['meta']
+        self.log_link('Letöltve: ', result['path'])
+
+        # A fájl a mentett tartalomból épül újra, ezért ha a generálás azóta
+        # változott, az eredmény eltérhet az annak idején beadott fájltól.
+        saved_version = meta.get('app_version')
+        if saved_version and saved_version != __version__:
+            self.log(f'Megjegyzés: az eredeti a(z) {saved_version} verzióval készült, '
+                     f'a mostani {__version__}. A tartalom azonos, a formátum eltérhet.')
+        saved_hash = meta.get('content_hash')
+        if saved_hash:
+            try:
+                if generate.content_hash(result['path']) != saved_hash:
+                    self.log('Figyelem: az újraépített munkafüzet tartalma eltér az '
+                             'eredetileg készülttől (a generálás azóta megváltozott).')
+            except Exception:
+                pass
 
     # --- Várakozási sor / Böngésző nézet (beágyazott, nem külön ablak) ---
 
@@ -1259,6 +1505,21 @@ class App:
                     action_btn.state(['!disabled'])
                     return
 
+                # Az írásjogot a letöltés ELŐTT nézzük meg: kár lenne 25 MB-ot
+                # letölteni, hogy aztán a csere jogosultság híján elbukjon.
+                if not updater.can_write_target():
+                    status.configure(
+                        text=f"Új verzió érhető el: {info['version']}\n\n"
+                             "Az alkalmazás mappájába nincs írásjog, ezért az "
+                             "automatikus csere nem lehetséges. Indítsd a programot "
+                             "rendszergazdaként, vagy töltsd le kézzel.",
+                        foreground=COLORS['danger'])
+                    action_btn.configure(
+                        text='Kiadás megnyitása',
+                        command=lambda: webbrowser.open(info.get('page') or RELEASES_PAGE))
+                    action_btn.state(['!disabled'])
+                    return
+
                 size = info.get('asset_size')
                 if size:
                     status.configure(text=f"Új verzió érhető el:  {info['version']}"
@@ -1456,6 +1717,30 @@ class App:
 
         ttk.Button(form, text='Tallózás...', style='Secondary.TButton',
                   command=browse_archive).grid(row=5, column=1, sticky='w', pady=(0, 10))
+
+        # Az adatok nem az .exe mellett vannak — mutassuk meg, hol keresse őket.
+        ttk.Label(form, text='Üresen hagyva:\n' + default_archive_dir(),
+                  background=COLORS['card'], foreground=COLORS['muted'],
+                  font=FONT_BASE, justify='left').grid(
+            row=6, column=1, sticky='w', pady=(0, 10))
+
+        locations = ttk.Frame(dlg, style='Card.TFrame')
+        locations.pack(padx=24, pady=(0, 6), anchor='w')
+        ttk.Label(locations, text='Az alkalmazás fájljai:', background=COLORS['card'],
+                  font=FONT_BOLD).pack(anchor='w')
+        ttk.Label(locations,
+                  text=f'Beállítások:  {filename_utils.user_data_dir()}\n'
+                       f'Archívum:     {default_archive_dir()}',
+                  background=COLORS['card'], foreground=COLORS['muted'],
+                  font=FONT_BASE, justify='left').pack(anchor='w', pady=(2, 4))
+
+        loc_btns = ttk.Frame(locations, style='Card.TFrame')
+        loc_btns.pack(anchor='w')
+        ttk.Button(loc_btns, text='📂  Beállítások mappa', style='Secondary.TButton',
+                   command=lambda: self._open_path(filename_utils.user_data_dir())
+                   ).pack(side='left', padx=(0, 6))
+        ttk.Button(loc_btns, text='📂  Archívum', style='Secondary.TButton',
+                   command=lambda: self._open_path(default_archive_dir())).pack(side='left')
 
         status_lbl = ttk.Label(dlg, text='', background=COLORS['card'], foreground=COLORS['danger'],
                                font=FONT_BASE, wraplength=380, justify='center')

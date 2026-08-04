@@ -1,11 +1,13 @@
 """Konfigurációs sablon.
 
 Ezt a fájlt jellemzően nem kell kézzel szerkeszteni: az alkalmazás oldalsávjában
-a ⚙ Beállítások ablak automatikusan létrehozza/frissíti a `config.py`-t az
-.exe (vagy a gui.py) mellett.
+a ⚙ Beállítások ablak automatikusan létrehozza/frissíti a titkosított
+`config.dat`-ot a felhasználói adatmappában (`%APPDATA%\\ebevTool\\`).
 
-Kézi szerkesztéshez: másold le ezt a fájlt `config.py` néven, és töltsd ki az
-értékeket a FIREBASE_SETUP.md útmutató alapján.
+Kézi szerkesztéshez: másold le ezt a fájlt `config.py` néven a
+`%APPDATA%\\ebevTool\\` mappába, és töltsd ki az értékeket a FIREBASE_SETUP.md
+útmutató alapján. A program az első indításkor beolvassa, titkosítva elmenti
+`config.dat` néven, majd törli az olvasható változatot.
 """
 
 # Firebase projekt Web API kulcsa (Project settings → General → Web API Key).
@@ -21,5 +23,5 @@ FIREBASE_PROJECT_ID = 'ide-a-project-id'
 # rekordok visszafejthetetlenné válnak!
 FERNET_KEY = 'IDE_A_FERNET_KULCS'
 
-# Helyi archívum mappa; None esetén a program melletti 'archívum' almappa.
+# Helyi archívum mappa; None esetén a 'Dokumentumok/ebevTool archívum'.
 ARCHIVE_DIR = None

@@ -44,6 +44,76 @@ def current_exe():
     return os.path.abspath(sys.executable)
 
 
+def short_path(path):
+    """A Windows rövid (8.3) útvonala, ami garantáltan ékezetmentes.
+
+    Erre azért van szükség, mert a cserét végző batch-et a cmd a rendszer
+    kódlapján olvassa, a konzol kódlapja viszont ettől eltérhet (magyar
+    Windowson tipikusan ANSI cp1250 / OEM cp852 / konzol UTF-8). Ha az
+    útvonalban ékezet van — például a felhasználó neve miatt —, a cmd nem
+    találja meg a fájlt, és a frissítés csendben elbukik.
+
+    A rövid név ASCII, így minden kódlapon ugyanazt jelenti. Ha a rendszeren
+    ki van kapcsolva a 8.3-as névgenerálás, az eredeti utat adjuk vissza.
+    """
+    if sys.platform != 'win32':
+        return str(path)
+    try:
+        import ctypes
+        buf = ctypes.create_unicode_buffer(32768)
+        n = ctypes.windll.kernel32.GetShortPathNameW(str(path), buf, 32768)
+        if n and buf.value:
+            return buf.value
+    except Exception:
+        pass
+    return str(path)
+
+
+def can_write_target():
+    """Igaz, ha a futó .exe mappájába tudunk írni.
+
+    A cserét egy batch végzi, ami átnevezi és felülírja az .exe-t — ehhez
+    írásjog kell a mappára. Ha a program 'Program Files' alá van telepítve,
+    ez rendszergazda nélkül nem megy, és a frissítés csendben elhalna.
+    Inkább előre megnézzük, és érthető üzenetet adunk.
+    """
+    if not is_frozen():
+        return False
+    folder = os.path.dirname(current_exe())
+    try:
+        fd, probe = tempfile.mkstemp(prefix='.ebevTool_write_test_', dir=folder)
+        os.close(fd)
+        _silent_remove(probe)
+        return True
+    except Exception:
+        return False
+
+
+def _update_workdir():
+    """Az ideiglenes frissítő-fájlok helye.
+
+    Nem az .exe mellé dolgozunk: ott a felhasználó látja a félkész fájlokat,
+    és a Program Files alatt írásjogunk sem feltétlenül van. A rendszer temp
+    mappája viszont más köteten lehet, ahonnan a batch 'move' parancsa nem
+    tudja átvinni a fájlt — ezért ilyenkor egy saját almappát használunk a
+    célkötet gyökerében, és azt a csere végén takarítjuk.
+    """
+    temp_dir = tempfile.gettempdir()
+    if not is_frozen():
+        return temp_dir
+    try:
+        exe_drive = os.path.splitdrive(current_exe())[0].upper()
+        temp_drive = os.path.splitdrive(os.path.abspath(temp_dir))[0].upper()
+        if exe_drive and exe_drive == temp_drive:
+            return temp_dir
+        # Eltérő kötet: a célkötetre tesszük, hogy a 'move' atomikus maradjon.
+        fallback = os.path.join(exe_drive + os.sep, 'ebevTool_update_tmp')
+        os.makedirs(fallback, exist_ok=True)
+        return fallback
+    except Exception:
+        return temp_dir
+
+
 def check_for_update():
     """A legfrissebb release adatai, vagy None ha nincs újabb verzió.
 
@@ -109,10 +179,9 @@ def download_asset(info, progress=None):
         raise UpdateError(f'A letöltés nem sikerült: {e}') from e
 
     total = int(r.headers.get('Content-Length') or info.get('asset_size') or 0)
-    target_dir = os.path.dirname(current_exe()) if is_frozen() else tempfile.gettempdir()
 
     fd, temp_path = tempfile.mkstemp(prefix='ebevTool_update_', suffix='.exe',
-                                     dir=target_dir)
+                                     dir=_update_workdir())
     downloaded = 0
     try:
         with os.fdopen(fd, 'wb') as f:
@@ -146,42 +215,55 @@ def _silent_remove(path):
 
 # A takarító batch: megvárja, míg a futó .exe elengedi a fájlt, lecseréli,
 # majd újraindítja az alkalmazást és törli önmagát.
+#
+# Három dologra kell figyelni:
+#   * a 'move' köteten belül átnevez, köteten át viszont másol — ha a forrás
+#     más meghajtón van, a parancs lassabb, de működik; a célfájl zárolása
+#     viszont mindkét esetben megbukhat, ezért újrapróbálunk;
+#   * a 'move' hibakódját nem az 'errorlevel' jelzi megbízhatóan minden
+#     Windows-verzión, ezért a csere tényét a fájl létezésével ellenőrizzük;
+#   * a batch szövege ASCII — ékezet nélkül! A cmd a sorokat a rendszer
+#     kódlapján olvassa, ezért az UTF-8 ékezetek eltörhetnek, és a szétesett
+#     'rem' sorok parancsként futnának le.
 _SWAP_BATCH = """@echo off
-chcp 65001 > nul
 set "TARGET={target}"
 set "SOURCE={source}"
+set "BACKUP=%TARGET%.old"
 
-rem Megvárjuk, míg a futó példány kilép és elengedi a fájlt (max ~30 mp).
+rem Megvarjuk, mig a futo peldany kilep es elengedi a fajlt (max ~60 mp).
 set /a TRIES=0
 :wait
 set /a TRIES+=1
-if %TRIES% GTR 60 goto failed
-move /y "%TARGET%" "%TARGET%.old" > nul 2>&1
-if errorlevel 1 (
+if %TRIES% GTR 120 goto failed
+move /y "%TARGET%" "%BACKUP%" > nul 2>&1
+if exist "%TARGET%" (
     ping -n 2 127.0.0.1 > nul
     goto wait
 )
 
+rem A csere: koteten at ez masolas, ezert eltarthat par masodpercig.
 move /y "%SOURCE%" "%TARGET%" > nul 2>&1
-if errorlevel 1 goto restore
+if not exist "%TARGET%" goto restore
 
-rem A régi példányt még az újraindítás előtt takarítjuk el, hogy ne
-rem zárolhassa az elinduló új verzió. Ha mégis bent marad, a program
-rem induláskori cleanup_leftovers() hívása később törli.
-del "%TARGET%.old" > nul 2>&1
+rem A regi peldanyt meg az ujrainditas elott takaritjuk el, hogy ne
+rem zarolhassa az elindulo uj verzio. Ha megis bent marad, a program
+rem indulaskori cleanup_leftovers() hivasa kesobb torli.
+del "%BACKUP%" > nul 2>&1
 start "" "%TARGET%"
 goto cleanup
 
 :restore
-rem A csere nem sikerült - visszaállítjuk az eredeti állományt.
-move /y "%TARGET%.old" "%TARGET%" > nul 2>&1
+rem A csere nem sikerult - visszaallitjuk az eredeti allomanyt.
+if exist "%BACKUP%" move /y "%BACKUP%" "%TARGET%" > nul 2>&1
 del "%SOURCE%" > nul 2>&1
-start "" "%TARGET%"
+if exist "%TARGET%" start "" "%TARGET%"
 goto cleanup
 
 :failed
+rem A futo peldany nem engedte el a fajlt - nem cserelunk, csak takaritunk.
 del "%SOURCE%" > nul 2>&1
-start "" "%TARGET%"
+if exist "%BACKUP%" if not exist "%TARGET%" move /y "%BACKUP%" "%TARGET%" > nul 2>&1
+if exist "%TARGET%" start "" "%TARGET%"
 
 :cleanup
 del "%~f0" > nul 2>&1
@@ -199,12 +281,25 @@ def apply_update(new_exe_path):
                           'működik (forrásból: git pull).')
     if not os.path.exists(new_exe_path):
         raise UpdateError('A letöltött frissítés nem található.')
+    if not can_write_target():
+        raise UpdateError(
+            'Az alkalmazás mappájába nincs írásjog, ezért a csere nem '
+            'végezhető el:\n'
+            f'{os.path.dirname(current_exe())}\n\n'
+            'Indítsd a programot rendszergazdaként, vagy másold át egy olyan '
+            'mappába, ahová írhatsz (pl. Dokumentumok).')
 
     target = current_exe()
     fd, batch_path = tempfile.mkstemp(prefix='ebevTool_update_', suffix='.bat',
-                                      dir=os.path.dirname(target))
-    with os.fdopen(fd, 'w', encoding='utf-8') as f:
-        f.write(_SWAP_BATCH.format(target=target, source=os.path.abspath(new_exe_path)))
+                                      dir=_update_workdir())
+    # Rövid (8.3) útvonalakat adunk a batch-nek: azok ékezetmentesek, így a
+    # cmd kódlapjától függetlenül megtalálja a fájlokat. Enélkül egy ékezetes
+    # felhasználónévnél a csere csendben elbukna.
+    body = _SWAP_BATCH.format(target=short_path(target),
+                              source=short_path(os.path.abspath(new_exe_path)))
+    # A batch szövege így végig ASCII — nincs kódlap-függő értelmezés.
+    with os.fdopen(fd, 'wb') as f:
+        f.write(body.encode('ascii', errors='replace'))
 
     creationflags = 0
     if hasattr(subprocess, 'CREATE_NO_WINDOW'):
@@ -230,17 +325,22 @@ def cleanup_leftovers():
     if not is_frozen():
         return
     exe = current_exe()
+    # A '.old' az .exe mellé kerül (a batch nevezi át) — ez marad a helyén.
     _silent_remove(exe + '.old')
-    folder = os.path.dirname(exe)
-    try:
-        for name in os.listdir(folder):
-            if name.startswith('ebevTool_update_') and name.endswith(('.bat', '.exe')):
-                path = os.path.join(folder, name)
-                # Csak a régebbi, biztosan elárvult fájlokat töröljük.
-                try:
-                    if os.path.getmtime(path) < os.path.getmtime(exe):
-                        _silent_remove(path)
-                except Exception:
-                    pass
-    except Exception:
-        pass
+
+    # A félkész letöltéseket és batch-eket a munkamappában keressük, de a régi
+    # verziók még az .exe mellé tették, ezért ott is takarítunk.
+    folders = {_update_workdir(), os.path.dirname(exe)}
+    for folder in folders:
+        try:
+            for name in os.listdir(folder):
+                if name.startswith('ebevTool_update_') and name.endswith(('.bat', '.exe')):
+                    path = os.path.join(folder, name)
+                    # Csak a régebbi, biztosan elárvult fájlokat töröljük.
+                    try:
+                        if os.path.getmtime(path) < os.path.getmtime(exe):
+                            _silent_remove(path)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
