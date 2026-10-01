@@ -32,6 +32,10 @@ service cloud.firestore {
     match /company_aliases/{token} {
       allow read, write: if request.auth != null;
     }
+    // a régi, minden cégre közös személylista (csak átvételhez és törléshez)
+    match /persons/{taj} {
+      allow read, write: if request.auth != null;
+    }
   }
 }
 ```

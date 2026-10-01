@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 import requests
 from cryptography.fernet import Fernet
 
-from generate import entry_key, iso_to_serial, serial_to_iso
+from generate import entry_key, iso_to_serial, serial_to_iso, taj_key
 
 IDENTITY_URL = 'https://identitytoolkit.googleapis.com/v1/accounts:signUp'
 FIRESTORE_BASE = 'https://firestore.googleapis.com/v1'
@@ -206,8 +206,11 @@ class FirebaseStore:
                         'Egy másik gép közben módosította ugyanezeket a rekordokat.')
                 raise FirebaseError(f'Firestore commit hiba ({r.status_code}): {r.text[:300]}')
 
-    def _delete_write(self, path):
-        return {'delete': f'{self.doc_root}/{path}'}
+    def _delete_write(self, path, if_unchanged_since=None):
+        write = {'delete': f'{self.doc_root}/{path}'}
+        if if_unchanged_since:
+            write['currentDocument'] = {'updateTime': if_unchanged_since}
+        return write
 
     def _update_write(self, path, fields, mask=None, if_unchanged_since=None):
         """Írás-művelet. Az 'if_unchanged_since' a dokumentum ismert verziója:
@@ -255,6 +258,10 @@ class FirebaseStore:
                 'id': doc['_id'],
                 'status': doc.get('status', 'pending'),
                 'consumed_in': doc.get('consumed_in'),
+                # Melyik hónap feldolgozása tette a sorba (a régebbi
+                # rekordoknál hiányzik) — ez kell az újrafeldolgozáskori
+                # takarításhoz.
+                'source_ym': doc.get('source_ym'),
                 'entry': entry,
                 # A beolvasáskori verzió: a feldolgozás végén ezzel tesszük
                 # feltételessé az írást (lásd sync_processing).
@@ -263,7 +270,7 @@ class FirebaseStore:
         return records
 
     def sync_processing(self, company, upsert_entries, consume_ids, ym, filename,
-                        history_extra=None, history_id=None):
+                        history_extra=None, history_id=None, stale_ids=()):
         """A várakozási sor frissítése és egy előzmény-rekord létrehozása.
 
         A 'consume_ids' elemei lehetnek sima azonosítók, vagy (id, verzió)
@@ -275,6 +282,11 @@ class FirebaseStore:
         egészíti ki az előzmény-dokumentumot. A 'history_id' megadható kívülről,
         hogy a hozzá tartozó snapshot ugyanazt az azonosítót kapja; enélkül
         újat generálunk. Visszaadja a használt azonosítót.
+
+        A 'stale_ids' (id, verzió) párjai azok a várakozó rekordok, amiket egy
+        korábbi feldolgozás tett a sorba ugyanebből a hónapból, de az új fájlban
+        már nem szerepelnek — ezeket (szintén feltételesen) töröljük, különben
+        a következő hónapban egy már nem létező bejelentés számítana be.
         """
         upsert_paths = [f'companies/{company}/memory/{entry_doc_id(e)}' for e in upsert_entries]
         existing = self._batch_get(upsert_paths)
@@ -283,13 +295,19 @@ class FirebaseStore:
         for entry, path in zip(upsert_entries, upsert_paths):
             if path in existing:
                 writes.append(self._update_write(
-                    path, {'payload': self._encrypt_entry(entry), 'updated_at': _now_iso()},
-                    mask=['payload', 'updated_at']))
+                    path, {'payload': self._encrypt_entry(entry), 'source_ym': ym,
+                           'updated_at': _now_iso()},
+                    mask=['payload', 'source_ym', 'updated_at']))
             else:
                 writes.append(self._update_write(path, {
                     'payload': self._encrypt_entry(entry), 'status': 'pending',
-                    'consumed_in': None, 'created_at': _now_iso(), 'updated_at': _now_iso(),
+                    'consumed_in': None, 'source_ym': ym,
+                    'created_at': _now_iso(), 'updated_at': _now_iso(),
                 }))
+
+        for doc_id, version in stale_ids:
+            writes.append(self._delete_write(
+                f'companies/{company}/memory/{doc_id}', if_unchanged_since=version))
 
         for item in consume_ids:
             doc_id, version = item if isinstance(item, (tuple, list)) else (item, None)
@@ -436,30 +454,40 @@ class FirebaseStore:
 
     @staticmethod
     def _taj_doc_id(taj):
-        normalized = ''.join(c for c in taj if c.isdigit())
-        return hashlib.sha256(normalized.encode('utf-8')).hexdigest()[:32]
+        return hashlib.sha256(taj_key(taj).encode('utf-8')).hexdigest()[:32]
 
-    def load_persons(self):
+    @staticmethod
+    def _persons_path(company):
+        """A személyek gyűjteménye cégenként külön.
+
+        A company=None a régi, minden cégre közös 'persons' gyűjtemény: ebből
+        már nem írunk újat, csak olvassuk (átvételhez) és törölhető.
+        """
+        return f'companies/{company}/persons' if company else 'persons'
+
+    def load_persons(self, company):
+        """A cég személyei, a normalizált TAJ szerint kulcsolva (lásd taj_key)."""
         persons = {}
-        for doc in self._list('persons'):
+        for doc in self._list(self._persons_path(company)):
             try:
                 person = self._decrypt_person(doc['payload'])
-                persons[person['taj']] = person
+                persons[taj_key(person['taj'])] = person
             except Exception:
                 continue
         return persons
 
-    def save_person(self, person):
+    def save_person(self, company, person):
         doc_id = self._taj_doc_id(person['taj'])
-        self._commit([self._update_write(f'persons/{doc_id}', {
+        self._commit([self._update_write(f'{self._persons_path(company)}/{doc_id}', {
             'payload': self._encrypt_person(person),
             'updated_at': _now_iso(),
         })])
 
-    def delete_person(self, taj):
+    def delete_person(self, company, taj):
         doc_id = self._taj_doc_id(taj)
-        self._request('DELETE', f'persons/{doc_id}')
+        self._request('DELETE', f'{self._persons_path(company)}/{doc_id}')
 
-    def delete_all_persons(self):
-        docs = self._list('persons')
-        self._commit([self._delete_write(f'persons/{d["_id"]}') for d in docs])
+    def delete_all_persons(self, company):
+        path = self._persons_path(company)
+        docs = self._list(path)
+        self._commit([self._delete_write(f'{path}/{d["_id"]}') for d in docs])

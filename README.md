@@ -52,8 +52,20 @@ szereplő **foglalkoztatói adószám** alapján történik.
 - **Várakozási sor / Böngésző** nézet: a Firestore-ban tárolt rekordok
   dekódolt böngészése és manuális törlése.
 - **Személyek** nézet: TAJ-hoz kötött, titkosítva tárolt személyi adatok
-  (szül. név, anyja neve, szül. hely/idő, lakcím). Ismeretlen TAJ-nál a
-  feldolgozás rákérdez, és a `Név Szerint` lap adatlapjait ezekből tölti ki.
+  (szül. név, anyja neve, szül. hely/idő, lakcím), **cégenként külön
+  listában** (cégválasztó fülekkel; a széles táblázat vízszintesen
+  görgethető). Ismeretlen TAJ-nál a feldolgozás rákérdez, és a `Név Szerint`
+  lap adatlapjait a cég listájából tölti ki.
+  > A korábbi verziók egyetlen, minden cégre közös listát használtak. Ez
+  > „Régi közös lista” fülként látszik; feldolgozáskor az ott már szereplő
+  > személyek kérdés nélkül átkerülnek az adott cég listájába.
+- **Hibás sorok jelzése**: ha egy sor kezdő dátuma vagy munkanapszáma nem
+  értelmezhető, a program a feldolgozás előtt felsorolja ezeket (a dátum
+  lehet szöveg `ÉÉÉÉ.HH.NN.` / `ÉÉÉÉ-HH-NN` alakban vagy Excel-dátumcella).
+- **Javított fájl újrafeldolgozása**: ha egy hónapot újra feldolgozol, és a
+  javított fájlból kikerült egy jövő havi bejelentés, a program a korábbi
+  futás által elmentett várakozó rekordot törli (ez csak az e verzió óta
+  mentett rekordokra működik).
 - **Helyi archívum**: a kimeneti fájl másolata automatikusan a
   `Dokumentumok/ebevTool archívum/<Cég>/<év-hónap>/` mappába kerül, így később
   is visszakereshető (a hely a Beállításokban átírható).
@@ -234,7 +246,7 @@ kötve, más gépre vagy fiókba átmásolva olvashatatlanok, és csak a Beáll�
 ablakon keresztül szerkeszthetők.
 
 A Firestore-ban a **várakozási sor** (titkosítva, max. fél éves megőrzéssel), a
-**személyi adatlapok** (titkosítva, TAJ-hoz kötve) és a feldolgozott hónapok
+**személyi adatlapok** (titkosítva, cégenként, TAJ-hoz kötve) és a feldolgozott hónapok
 **statisztika-tartalma** (titkosítva) tárolódik. Mindhármat ugyanaz a Fernet
 kulcs védi — ha ez elvész, az adatok visszafejthetetlenné válnak.
 

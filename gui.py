@@ -27,6 +27,7 @@ if sys.platform == 'win32':
         pass
 
 import tkinter as tk
+from tkinter import font as tkfont
 from tkinter import filedialog, messagebox, ttk
 
 try:
@@ -44,7 +45,7 @@ import dpapi_crypto
 import updater
 from dpapi_crypto import DPAPIError
 from firebase_store import (ConflictError, FirebaseError, FirebaseStore,
-                            months_between, ym_today)
+                            entry_doc_id, months_between, ym_today)
 from version import RELEASES_PAGE, __version__
 
 CONFIG_FIELDS = ('FIREBASE_API_KEY', 'FIREBASE_PROJECT_ID', 'FERNET_KEY', 'ARCHIVE_DIR')
@@ -130,6 +131,9 @@ service cloud.firestore {
 }"""
 
 FIREBASE_CONSOLE_URL = 'https://console.firebase.google.com/'
+
+# A Személyek nézet füle a régi, minden cégre közös személylistának.
+LEGACY_PERSONS_TAB = '📦 Régi közös lista'
 
 
 def default_archive_dir():
@@ -286,7 +290,7 @@ class App:
         self.queue_state = {'trees': {}, 'companies': []}
         self.update_available = None
 
-        self._persons = None  # None = még nem töltöttük be; dict = betöltött cache
+        self.persons_state = {}
         self._init_store()
 
         root.title('ebevTool – Statisztika generálás')
@@ -308,7 +312,6 @@ class App:
         global config
         config = load_runtime_config()
         self._online = None
-        self._persons = None
         if config is not None:
             self.store = FirebaseStore(config.FIREBASE_API_KEY,
                                        config.FIREBASE_PROJECT_ID,
@@ -722,18 +725,18 @@ class App:
             'Adatok betöltése...')
 
     def _load_context_work(self, ctx):
-        """Személyek (ha még nincsenek) és a cég adott havi előzményei."""
-        result = {'persons': None, 'history': []}
+        """A cég személyei, a régi közös személylista és a cég adott havi előzményei."""
+        result = {'persons': {}, 'legacy_persons': {}, 'history': []}
         if not self.store:
             return result
         online, _ = self._try_sign_in()
         if not online:
             return result
-        if self._persons is None:
+        for key, company in (('persons', ctx['company']), ('legacy_persons', None)):
             try:
-                result['persons'] = self.store.load_persons()
+                result[key] = self.store.load_persons(company)
             except Exception:
-                result['persons'] = {}
+                result[key] = {}
         try:
             result['history'] = [
                 row for row in self.store.load_history(ctx['company'])
@@ -743,12 +746,11 @@ class App:
         return result
 
     def _on_context_loaded(self, loaded, error, ctx):
-        if loaded and loaded.get('persons') is not None:
-            self._persons = loaded['persons']
-        if self._persons is None:
-            self._persons = {}
+        loaded = loaded or {}
+        ctx['persons'] = dict(loaded.get('persons') or {})
+        ctx['legacy_persons'] = loaded.get('legacy_persons') or {}
 
-        previous = (loaded or {}).get('history') or []
+        previous = loaded.get('history') or []
         if previous and not self._confirm_reprocess(ctx, previous):
             self.log('Megszakítva: ezt a hónapot már feldolgozták.')
             return
@@ -779,23 +781,35 @@ class App:
             icon='warning')
 
     def _process_file_check_persons(self, ctx):
+        persons = ctx['persons']
+        legacy = ctx['legacy_persons']
         all_entries = ctx['current_entries'] + ctx['future_entries']
         seen_taj = set()
         unknown_entries = []
         for entry in all_entries:
-            taj = entry.get('taj', '').strip()
-            if taj and taj not in self._persons and taj not in seen_taj:
-                seen_taj.add(taj)
+            key = generate.taj_key(entry.get('taj', ''))
+            if key and key not in persons and key not in seen_taj:
+                seen_taj.add(key)
                 unknown_entries.append(entry)
 
         new_persons = []
+        adopted = 0
         for entry in unknown_entries:
-            person_data = self._ask_person_dialog(entry['nev'], entry['taj'])
+            key = generate.taj_key(entry['taj'])
+            if key in legacy:
+                # A régi, közös személylistában már megvan: rákérdezés nélkül
+                # átvesszük ennek a cégnek a listájába.
+                person_data = dict(legacy[key])
+                adopted += 1
+            else:
+                person_data = self._ask_person_dialog(entry['nev'], entry['taj'])
             if person_data:
-                self._persons[entry['taj']] = person_data
+                persons[key] = person_data
                 new_persons.append(person_data)
 
-        ctx['persons'] = dict(self._persons)
+        if adopted:
+            self.log(f'{adopted} személy adatai átvéve a régi közös listából '
+                     f'a(z) {ctx["company"]} cég listájába.')
         ctx['new_persons'] = new_persons
 
         self.run_async(
@@ -829,8 +843,23 @@ class App:
 
         self._log_flagged_rows(data_rows, fmt)
 
+        row_problems = []
         current_month_serial, current_entries, future_entries = \
-            generate.extract_entries(data_rows, fmt)
+            generate.extract_entries(data_rows, fmt, problems=row_problems)
+        if row_problems:
+            for nev, problem in row_problems:
+                self.log(f'FIGYELEM: {nev or "(név nélkül)"}: {problem}')
+            listed = '\n'.join(f'• {nev or "(név nélkül)"}: {problem}'
+                               for nev, problem in row_problems[:15])
+            if len(row_problems) > 15:
+                listed += f'\n… és még {len(row_problems) - 15} sor (lásd a naplót)'
+            if not messagebox.askokcancel(
+                    'Hibás sorok a fájlban',
+                    f'{len(row_problems)} sort nem lehetett rendesen értelmezni:\n\n'
+                    f'{listed}\n\nA statisztika ezek nélkül / így készül el. Folytatod?',
+                    icon='warning'):
+                self.log('Megszakítva a hibás sorok miatt.')
+                return None
         if current_month_serial is None:
             messagebox.showerror(
                 'Hiba', 'Nem határozható meg a fájl hónapja (nincsenek '
@@ -899,6 +928,8 @@ class App:
 
         carried = []
         to_consume = []
+        stale = []
+        future_ids = {entry_doc_id(e) for e in ctx['future_entries']}
         for rec in records:
             entry_ym = generate.serial_to_ym(
                 generate.serial_to_month_serial(rec['entry']['start_serial']))
@@ -909,6 +940,12 @@ class App:
                 to_consume.append((rec['id'], rec.get('version')))
             elif rec['status'] == 'consumed' and rec['consumed_in'] == ctx['ym']:
                 carried.append(rec['entry'])
+            elif (rec['status'] == 'pending' and rec.get('source_ym') == ctx['ym']
+                  and rec['id'] not in future_ids):
+                # Egy korábbi feldolgozás tette a sorba ugyanebből a hónapból,
+                # de az új (javított) fájlban már nincs benne: törölni kell,
+                # különben jövő hónapban nem létező munkanapként számítana be.
+                stale.append((rec['id'], rec.get('version')))
 
         entries = generate.merge_entries(ctx['current_entries'], carried)
         logs.append(('text', f"Rekordok a fájlból: {len(ctx['current_entries'])}, átvitt: {len(carried)}, "
@@ -917,10 +954,11 @@ class App:
         if online and ctx.get('new_persons'):
             for person in ctx['new_persons']:
                 try:
-                    self.store.save_person(person)
+                    self.store.save_person(ctx['company'], person)
                 except Exception as e:
                     logs.append(('text', f'Személy mentése Firestore-ba sikertelen: {e}'))
-            logs.append(('text', f"{len(ctx['new_persons'])} új személy elmentve az adatbázisba."))
+            logs.append(('text', f"{len(ctx['new_persons'])} új személy elmentve "
+                                 f"a(z) {ctx['company']} cég listájába."))
 
         output_file = generate.generate_output(
             ctx['path'], ctx['header'], ctx['data_rows'], entries,
@@ -966,12 +1004,15 @@ class App:
                 self.store.sync_processing(ctx['company'], ctx['future_entries'], to_consume,
                                            ctx['ym'], ctx['filename'],
                                            history_extra=history_extra,
-                                           history_id=history_id)
+                                           history_id=history_id,
+                                           stale_ids=stale)
                 deleted = self.store.cleanup_expired(ctx['company'])
                 if deleted:
                     logs.append(('text', f'Takarítás: {deleted} lejárt rekord véglegesen törölve.'))
                 logs.append(('text', f"Várakozási sor frissítve ({len(ctx['future_entries'])} mentve, "
-                                     f"{len(to_consume)} felhasználva)."))
+                                     f"{len(to_consume)} felhasználva"
+                                     + (f", {len(stale)} elavult törölve" if stale else '')
+                                     + ")."))
             except ConflictError:
                 # Valaki más ugyanezeket a rekordokat közben felhasználta. A
                 # várakozási sor érintetlen maradt (a commit atomikus), így a
@@ -1134,12 +1175,16 @@ class App:
             if not loaded:
                 return {'ok': False, 'reason': 'A mentett tartalom nem található.'}
             args = generate.snapshot_to_args(loaded['payload'])
-            # A személyi adatlapokat a jelenlegi állapotból töltjük: a snapshot
-            # szándékosan nem duplikálja a 'persons' kollekciót.
-            try:
-                persons = self.store.load_persons()
-            except Exception:
-                persons = {}
+            # A személyi adatlapokat a cég jelenlegi listájából töltjük: a
+            # snapshot szándékosan nem duplikálja a személyek kollekcióját.
+            # Tartaléknak a régi közös lista szolgál — egy régi hónap
+            # személyei még csak abban lehetnek; a cég saját adata erősebb.
+            persons = {}
+            for source in (None, company):
+                try:
+                    persons.update(self.store.load_persons(source))
+                except Exception:
+                    pass
             # output_path megadva, ezért az első paraméter (input_path) nem
             # számít — a névképzéshez használná, amit itt a felhasználó ad meg.
             generate.generate_output(
@@ -1316,17 +1361,32 @@ class App:
         select(companies[0])
         return frames, select, state
 
-    def _make_tree(self, parent, extra_cols, col_spec):
+    def _make_tree(self, parent, extra_cols, col_spec, hscroll=False):
+        """Táblázat függőleges (és kérésre vízszintes) görgetősávval.
+
+        Vízszintes görgetésnél az oszlopok nem nyúlnak/zsugorodnak az ablakhoz
+        (stretch=False), különben a hosszú tartalom sosem lógna ki, csak
+        levágódna — így a széles táblázat oldalra görgethető.
+        """
         wrap = tk.Frame(parent, bg=COLORS['card'])
         wrap.pack(fill='both', expand=True, padx=12, pady=12)
+        wrap.grid_rowconfigure(0, weight=1)
+        wrap.grid_columnconfigure(0, weight=1)
         tree = ttk.Treeview(wrap, columns=extra_cols)
         for key, (label, width) in col_spec.items():
             tree.heading(key, text=label)
-            tree.column(key, width=width)
+            tree.column(key, width=width, minwidth=60, stretch=not hscroll)
         vsb = ttk.Scrollbar(wrap, orient='vertical', command=tree.yview)
         tree.configure(yscrollcommand=vsb.set)
-        tree.pack(side='left', fill='both', expand=True)
-        vsb.pack(side='right', fill='y')
+        tree.grid(row=0, column=0, sticky='nsew')
+        vsb.grid(row=0, column=1, sticky='ns')
+        if hscroll:
+            hsb = ttk.Scrollbar(wrap, orient='horizontal', command=tree.xview)
+            tree.configure(xscrollcommand=hsb.set)
+            hsb.grid(row=1, column=0, sticky='ew')
+            # Shift+görgő: oldalirányú görgetés
+            tree.bind('<Shift-MouseWheel>',
+                      lambda e: tree.xview_scroll(-1 if e.delta > 0 else 1, 'units'))
         tree.tag_configure('odd', background=COLORS['row_alt'])
         tree.tag_configure('even', background=COLORS['card'])
         return tree
@@ -1835,6 +1895,7 @@ class App:
             self.store.delete_all_memory(c)
             self.store.delete_all_history(c)
             self.store.delete_all_aliases(c)
+            self.store.delete_all_persons(c)
 
         def work():
             online, err = self._try_sign_in()
@@ -1844,7 +1905,7 @@ class App:
                 self._parallel_map(companies, wipe_company)
                 done_companies = companies
                 try:
-                    self.store.delete_all_persons()
+                    self.store.delete_all_persons(None)  # a régi közös lista
                 except Exception:
                     pass
             return {'online': online, 'error': err, 'companies': done_companies}
@@ -1853,7 +1914,6 @@ class App:
 
     def _on_reset_done(self, result, error):
         filename_utils.reset_local_aliases()
-        self._persons = None
         self.status.configure(state='normal')
         self.status.delete('1.0', 'end')
         self.status.configure(state='disabled')
@@ -1897,8 +1957,13 @@ class App:
             online, err = self._try_sign_in()
             if not online:
                 return {'online': False, 'error': err}
-            persons = self.store.load_persons()
-            return {'online': True, 'persons': persons}
+            companies = self.known_companies()
+            data = self._parallel_map(companies, self.store.load_persons)
+            try:
+                legacy = self.store.load_persons(None)
+            except Exception:
+                legacy = {}
+            return {'online': True, 'companies': companies, 'data': data, 'legacy': legacy}
 
         self.run_async(work, self._on_persons_loaded_for_page, 'Személyek betöltése...')
 
@@ -1912,10 +1977,22 @@ class App:
             self._render_page_message(page, f'A Firestore nem érhető el.{extra}')
             return
 
-        persons = result['persons']
-        self._persons = persons
+        # Fülek: cégenként egy, plusz a régi közös lista, ha még van benne valami.
+        # A belső kulcs a cégnév, a régi listáé None (így hívja a store is).
+        tabs = [(c, c) for c in result['companies']]
+        data = dict(result['data'])
+        if result['legacy']:
+            tabs.append((LEGACY_PERSONS_TAB, None))
+            data[None] = result['legacy']
+        if not tabs:
+            self._render_page_message(
+                page, 'Még nincs egyetlen ismert cég sem.\n'
+                      'Generáláskor a rendszer rákérdez az ismeretlen személyekre.')
+            return
 
         self._clear_body(page)
+        labels = [label for label, _ in tabs]
+        company_of = dict(tabs)
 
         btns_frame = ttk.Frame(page.body)
         btns_frame.pack(side='bottom', fill='x', pady=(10, 0))
@@ -1925,6 +2002,12 @@ class App:
                    command=self._delete_selected_person).pack(side='left', padx=8)
         ttk.Button(btns_frame, text='🔄  Frissítés', style='Secondary.TButton',
                    command=self.show_persons).pack(side='left')
+        ttk.Label(btns_frame, text='Tipp: Shift + egérgörgő = oldalra görgetés',
+                  style='Muted.TLabel').pack(side='right')
+
+        frames, select, switcher_state = self._build_company_switcher(page.body, labels)
+        self.persons_state = {'trees': {}, 'data': data, 'company_of': company_of,
+                              'switcher_state': switcher_state, 'select': select}
 
         cols = ('taj', 'szul_nev', 'anya_neve', 'szul_hely_ido', 'lakcim')
         col_spec = {
@@ -1935,67 +2018,102 @@ class App:
             'szul_hely_ido': ('Szül.hely, idő', 160),
             'lakcim': ('Lakcím', 180),
         }
-        tree = self._make_tree(page.body, cols, col_spec)
-        self._persons_tree = tree
-        tree.bind('<Double-1>', lambda e: self._edit_selected_person())
+        for label in labels:
+            frame = frames[label]
+            if company_of[label] is None:
+                ttk.Label(frame, text='A régi, minden cégre közös lista. Feldolgozáskor '
+                                      'innen automatikusan átkerülnek a személyek az adott '
+                                      'cég listájába; ha már mind átkerült, ez a lista törölhető.',
+                          style='Muted.TLabel', background=COLORS['card'],
+                          wraplength=700, justify='left').pack(anchor='w', padx=12, pady=(10, 0))
+            tree = self._make_tree(frame, cols, col_spec, hscroll=True)
+            tree.bind('<Double-1>', lambda e: self._edit_selected_person())
+            self.persons_state['trees'][label] = tree
+            self._fill_persons_tree(tree, data[company_of[label]])
 
+    def _fill_persons_tree(self, tree, persons):
+        tree.delete(*tree.get_children())
         if not persons:
-            wrap = ttk.Frame(page.body)
-            wrap.place(relx=0.5, rely=0.4, anchor='center')
-            ttk.Label(wrap, text='👤', font=('Segoe UI', 24), background=COLORS['bg']).pack()
-            ttk.Label(wrap, text='Még nincsenek személyek rögzítve.\nGeneráláskor a rendszer rákérdez az ismeretlen személyekre.',
-                      style='Muted.TLabel', wraplength=360, justify='center').pack(pady=(8, 0))
+            tree.insert('', 'end', iid='__empty__',
+                        text='(Ennél a cégnél még nincsenek személyek rögzítve.)')
+            self._autosize_columns(tree)
             return
-
-        for i, (taj, p) in enumerate(sorted(persons.items(), key=lambda x: x[1].get('nev', '').lower())):
-            tree.insert('', 'end', iid=taj, text=p.get('nev', ''),
+        for i, (key, p) in enumerate(sorted(persons.items(),
+                                            key=lambda x: x[1].get('nev', '').lower())):
+            # üres TAJ-ú (régi) rekordnál a kulcs üres lenne, ami nem lehet iid
+            tree.insert('', 'end', iid=key or f'__nokey_{i}', text=p.get('nev', ''),
                         values=(p.get('taj', ''), p.get('szul_nev', ''), p.get('anya_neve', ''),
                                 p.get('szul_hely_ido', ''), p.get('lakcim', '')),
                         tags=('odd' if i % 2 else 'even',))
+        self._autosize_columns(tree)
+
+    @staticmethod
+    def _autosize_columns(tree, padding=24, max_width=700):
+        """Az oszlopok szélessége a leghosszabb tartalomhoz igazítva.
+
+        A széles oszlopok miatt a táblázat kilóghat az ablakból — ezt a
+        vízszintes görgetősáv kezeli, így a hosszú lakcím sem vágódik le.
+        """
+        # ugyanazokkal a betűkkel mérünk, mint amikkel a 'Treeview' stílus rajzol
+        font = tkfont.Font(font=FONT_BASE)
+        head_font = tkfont.Font(font=FONT_BOLD)
+        columns = ('#0',) + tuple(tree['columns'])
+        widths = {c: head_font.measure(tree.heading(c, 'text')) for c in columns}
+        for iid in tree.get_children():
+            item = tree.item(iid)
+            texts = [item['text']] + [str(v) for v in item['values']]
+            for col, text in zip(columns, texts):
+                widths[col] = max(widths[col], font.measure(text))
+        for col, w in widths.items():
+            # a '#0' oszlopban a fa-behúzás is helyet foglal
+            extra = 20 if col == '#0' else 0
+            tree.column(col, width=min(w + padding + extra, max_width))
+
+    def _selected_person(self, action):
+        """(cég, kulcs, személy) a kijelölt sorhoz, vagy None."""
+        state = self.persons_state
+        if not state.get('trees'):
+            return None
+        label = state['switcher_state']['active']
+        tree = state['trees'][label]
+        sel = [i for i in tree.selection() if i != '__empty__']
+        if not sel:
+            messagebox.showinfo(action, 'Válassz ki egy személyt a listából.')
+            return None
+        company = state['company_of'][label]
+        person = state['data'][company].get(sel[0])
+        if not person:
+            return None
+        return company, sel[0], person
 
     def _edit_selected_person(self):
-        if not hasattr(self, '_persons_tree'):
-            return
-        tree = self._persons_tree
-        sel = tree.selection()
-        if not sel:
-            messagebox.showinfo('Szerkesztés', 'Válassz ki egy személyt a listából.')
-            return
-        taj = sel[0]
-        person = (self._persons or {}).get(taj)
-        if not person:
-            return
-        self._open_person_edit_dialog(person)
+        picked = self._selected_person('Szerkesztés')
+        if picked:
+            company, _, person = picked
+            self._open_person_edit_dialog(company, person)
 
     def _delete_selected_person(self):
-        if not hasattr(self, '_persons_tree'):
+        picked = self._selected_person('Törlés')
+        if not picked:
             return
-        tree = self._persons_tree
-        sel = tree.selection()
-        if not sel:
-            messagebox.showinfo('Törlés', 'Válassz ki egy személyt a listából.')
-            return
-        taj = sel[0]
-        person = (self._persons or {}).get(taj, {})
-        nev = person.get('nev', taj)
+        company, key, person = picked
+        where = f'a(z) {company} cég listájából' if company else 'a régi közös listából'
         if not messagebox.askyesno('Törlés megerősítése',
-                                   f'Véglegesen törlöd {nev} adatait az adatbázisból?'):
+                                   f'Véglegesen törlöd {person.get("nev") or key} adatait {where}?'):
             return
 
         def work():
-            self.store.delete_person(taj)
+            self.store.delete_person(company, person.get('taj') or key)
 
         def done(_, error):
             if error:
                 messagebox.showerror('Hiba', f'Törlés sikertelen: {error}')
                 return
-            if self._persons and taj in self._persons:
-                del self._persons[taj]
             self.show_persons()
 
         self.run_async(work, done, 'Törlés...')
 
-    def _open_person_edit_dialog(self, person, on_save=None):
+    def _open_person_edit_dialog(self, company, person):
         dlg = tk.Toplevel(self.root)
         dlg.title('Személy szerkesztése')
         dlg.configure(bg=COLORS['card'])
@@ -2036,18 +2154,14 @@ class App:
                 updated[key] = var.get().strip()
 
             def work():
-                self.store.save_person(updated)
+                self.store.save_person(company, updated)
                 return updated
 
             def done(result, error):
                 if error:
                     messagebox.showerror('Hiba', f'Mentés sikertelen: {error}')
                     return
-                if self._persons is not None:
-                    self._persons[updated['taj']] = updated
                 status_lbl.configure(text='✓ Elmentve')
-                if on_save:
-                    on_save(updated)
                 dlg.after(700, dlg.destroy)
                 self.show_persons()
 

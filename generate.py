@@ -1,5 +1,6 @@
 import hashlib
-from datetime import datetime, timedelta
+import re
+from datetime import date, datetime, timedelta
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import PatternFill, Font
@@ -83,15 +84,27 @@ FORMATS = (NAV2026_FORMAT, LEGACY_FORMAT)
 DEFAULT_FORMAT = LEGACY_FORMAT
 
 
-def date_str_to_serial(date_str):
-    cleaned = str(date_str).rstrip('.').strip()
-    parts = cleaned.split('.')
-    if len(parts) < 3:
+_DATE_RE = re.compile(r'^\s*(\d{4})\s*[.\-/]\s*(\d{1,2})\s*[.\-/]\s*(\d{1,2})')
+
+
+def date_str_to_serial(value):
+    """Egy dátum cellaérték -> Excel serial, vagy None ha nem értelmezhető.
+
+    Elfogadja a szöveges 'ÉÉÉÉ.HH.NN.' és 'ÉÉÉÉ-HH-NN' alakot (utána időponttal
+    is), valamint a valódi Excel-dátumcellát (datetime/date), mert az
+    openpyxl a dátumként formázott cellát már datetime-ként adja vissza.
+    """
+    if value is None:
+        return None
+    if isinstance(value, date):  # a datetime is ide tartozik
+        return (datetime(value.year, value.month, value.day) - EPOCH).days
+    match = _DATE_RE.match(str(value))
+    if not match:
         return None
     try:
-        y, m, d = int(parts[0]), int(parts[1]), int(parts[2])
+        y, m, d = (int(g) for g in match.groups())
         return (datetime(y, m, d) - EPOCH).days
-    except Exception:
+    except ValueError:
         return None
 
 
@@ -115,6 +128,15 @@ def serial_to_iso(serial):
 
 def iso_to_serial(iso):
     return (datetime.fromisoformat(iso) - EPOCH).days
+
+
+def taj_key(taj):
+    """A TAJ-szám összehasonlítható alakja: csak a számjegyek.
+
+    Így a '123 456 789' és a '123456789' ugyanannak a személynek számít.
+    """
+    digits = ''.join(c for c in str(taj or '') if c.isdigit())
+    return digits or str(taj or '').strip()
 
 
 def entry_key(entry):
@@ -226,7 +248,19 @@ def check_header(header, fmt=DEFAULT_FORMAT):
     return problems
 
 
-def extract_entries(data_rows, fmt=DEFAULT_FORMAT):
+def _cell_value(row, idx):
+    return row[idx] if idx is not None and len(row) > idx else None
+
+
+def extract_entries(data_rows, fmt=DEFAULT_FORMAT, problems=None):
+    """A feldolgozandó bejegyzések kinyerése.
+
+    A 'problems' listába (ha megadjuk) kerül minden sor, amit nem lehetett
+    rendesen értelmezni, (név, leírás) párként — ezeket a hívónak kell
+    jeleznie, különben a statisztika csendben hiányos lenne.
+    """
+    if problems is None:
+        problems = []
     active_rows = [r for r in data_rows
                    if not is_torles(r, fmt) and not is_hibas(r, fmt)]
 
@@ -236,8 +270,7 @@ def extract_entries(data_rows, fmt=DEFAULT_FORMAT):
 
     bejelentes_months = {}
     for r in active_rows:
-        raw = cell_text(r, c_bejelentes)
-        s = date_str_to_serial(raw.split(' ')[0]) if raw else None
+        s = date_str_to_serial(_cell_value(r, c_bejelentes))
         if s:
             ms = serial_to_month_serial(s)
             bejelentes_months[ms] = bejelentes_months.get(ms, 0) + 1
@@ -246,13 +279,20 @@ def extract_entries(data_rows, fmt=DEFAULT_FORMAT):
     current_entries = []
     future_entries = []
     for r in active_rows:
-        try:
-            munkanapok = int(r[c_munkanapok])
-        except Exception:
-            munkanapok = 1
-        start_serial = date_str_to_serial(cell_text(r, c_kezdes))
+        nev = cell_text(r, fmt.col('nev'))
+        start_serial = date_str_to_serial(_cell_value(r, c_kezdes))
         if start_serial is None:
+            problems.append((nev, f'értelmezhetetlen kezdő dátum '
+                                  f'("{cell_text(r, c_kezdes)}") — a sor KIMARADT'))
             continue
+        try:
+            munkanapok = int(float(str(_cell_value(r, c_munkanapok)).strip().replace(',', '.')))
+            if munkanapok < 1:
+                raise ValueError
+        except (TypeError, ValueError):
+            problems.append((nev, f'értelmezhetetlen munkanapszám '
+                                  f'("{cell_text(r, c_munkanapok)}") — 1 napként számolva'))
+            munkanapok = 1
         entry = {
             'nev': cell_text(r, fmt.col('nev')),
             'adoazonosito': cell_text(r, fmt.col('adoazonosito')),
@@ -437,7 +477,7 @@ def generate_output(input_path, header, data_rows, entries, output_path=None,
     ws_nev = wb_out.create_sheet('Név Szerint')
     for nev in sorted_names:
         info = by_name[nev]
-        p = persons.get(info['taj'], {})
+        p = persons.get(taj_key(info['taj']), {})
         ws_nev.append(['név:', nev, '', '', ''])
         ws_nev.append(['szül.név', p.get('szul_nev', ''), '', '', ''])
         ws_nev.append(['anyja neve:', p.get('anya_neve', ''), '', '', ''])
