@@ -69,6 +69,21 @@ def short_path(path):
     return str(path)
 
 
+def batch_safe_path(path):
+    """A batch számára biztonságos útvonal: rövid (8.3) MAPPA + eredeti fájlnév.
+
+    A mappát rövidítjük, mert az ékezetes lehet (felhasználónév), és a csere
+    alatt végig létezik. A fájlnevet viszont NEM: a csere közben a régi fájl
+    átnevezésre kerül, így a rövid neve (pl. STATIS~1.EXE) megszűnik, és a
+    'move' szó szerint ezen a néven hozná létre az új .exe-t. A fájlnév csak
+    akkor rövidül, ha nem ASCII — ezt a batch máshogy nem tudná leírni.
+    """
+    folder, name = os.path.split(os.path.abspath(path))
+    if not name.isascii():
+        return short_path(path)
+    return os.path.join(short_path(folder), name)
+
+
 def can_write_target():
     """Igaz, ha a futó .exe mappájába tudunk írni.
 
@@ -270,6 +285,35 @@ del "%~f0" > nul 2>&1
 """
 
 
+def _clean_child_env():
+    """A futó példány környezete a PyInstaller saját változói nélkül.
+
+    A csomagolt .exe induláskor _PYI_* változókba írja a saját ideiglenes
+    mappáját. Ha ezeket a cserélő batch örökli, az általa újraindított új
+    .exe — mivel ugyanazon az útvonalon van — a régi példány gyerekének hiszi
+    magát, és annak (kilépéskor már törölt) mappájából töltené a Pythont:
+    „Failed to load Python DLL”. A PYINSTALLER_RESET_ENVIRONMENT=1 a
+    PyInstaller előírt jelzése arra, hogy az új folyamat önálló példány.
+    """
+    meipass = getattr(sys, '_MEIPASS', None)
+    env = {}
+    for key, value in os.environ.items():
+        upper = key.upper()
+        if upper.startswith('_PYI_') or upper in ('_MEIPASS', '_MEIPASS2'):
+            continue
+        if meipass and meipass.lower() in value.lower():
+            if ';' in value:
+                # útvonal-lista (pl. PATH): csak a régi mappára mutató elemek mennek
+                value = ';'.join(p for p in value.split(';')
+                                 if meipass.lower() not in p.lower())
+            else:
+                # pl. a tkinter TCL_LIBRARY / TK_LIBRARY változója
+                continue
+        env[key] = value
+    env['PYINSTALLER_RESET_ENVIRONMENT'] = '1'
+    return env
+
+
 def apply_update(new_exe_path):
     """Elindítja a cserét végző batch-et. A hívónak ezután ki kell lépnie.
 
@@ -292,24 +336,24 @@ def apply_update(new_exe_path):
     target = current_exe()
     fd, batch_path = tempfile.mkstemp(prefix='ebevTool_update_', suffix='.bat',
                                       dir=_update_workdir())
-    # Rövid (8.3) útvonalakat adunk a batch-nek: azok ékezetmentesek, így a
-    # cmd kódlapjától függetlenül megtalálja a fájlokat. Enélkül egy ékezetes
-    # felhasználónévnél a csere csendben elbukna.
-    body = _SWAP_BATCH.format(target=short_path(target),
-                              source=short_path(os.path.abspath(new_exe_path)))
+    # Rövid (8.3) mappaútvonalakat adunk a batch-nek: azok ékezetmentesek, így
+    # a cmd kódlapjától függetlenül megtalálja a fájlokat. Enélkül egy ékezetes
+    # felhasználónévnél a csere csendben elbukna. A fájlnév marad (lásd
+    # batch_safe_path), különben az új .exe 'STATIS~1.EXE' néven jönne létre.
+    body = _SWAP_BATCH.format(target=batch_safe_path(target),
+                              source=batch_safe_path(new_exe_path))
     # A batch szövege így végig ASCII — nincs kódlap-függő értelmezés.
     with os.fdopen(fd, 'wb') as f:
         f.write(body.encode('ascii', errors='replace'))
 
-    creationflags = 0
-    if hasattr(subprocess, 'CREATE_NO_WINDOW'):
-        creationflags |= subprocess.CREATE_NO_WINDOW
-    if hasattr(subprocess, 'DETACHED_PROCESS'):
-        creationflags |= subprocess.DETACHED_PROCESS
+    # Csak CREATE_NO_WINDOW: a DETACHED_PROCESS mellett a Windows figyelmen
+    # kívül hagyja, és a batch minden 'ping'-je saját, látható konzolablakot
+    # kapna. Így a batch egy rejtett konzolt kap, amit a gyerekei is örökölnek.
+    creationflags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
     try:
         subprocess.Popen(['cmd', '/c', batch_path], creationflags=creationflags,
-                         close_fds=True)
+                         close_fds=True, env=_clean_child_env())
     except Exception as e:
         _silent_remove(batch_path)
         _silent_remove(new_exe_path)

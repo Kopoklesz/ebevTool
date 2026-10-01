@@ -54,8 +54,12 @@ szereplő **foglalkoztatói adószám** alapján történik.
 - **Személyek** nézet: TAJ-hoz kötött, titkosítva tárolt személyi adatok
   (szül. név, anyja neve, szül. hely/idő, lakcím), **cégenként külön
   listában** (cégválasztó fülekkel; a széles táblázat vízszintesen
-  görgethető). Ismeretlen TAJ-nál a feldolgozás rákérdez, és a `Név Szerint`
-  lap adatlapjait a cég listájából tölti ki.
+  görgethető). Ismeretlen TAJ-nál a feldolgozás rákérdez (sorszámmal, pl.
+  `2 / 5`), és a `Név Szerint` lap adatlapjait a cég listájából tölti ki. Az
+  **Összes kihagyása** gombbal a hátralévő kérdések egy kattintással
+  átugorhatók: a kihagyottak bekerülnek a statisztikába, csak az adatlapjuk
+  marad üres, és legközelebb újra rákérdez. Ha a személylista nem érhető el
+  (nincs kapcsolat), a program nem kérdez, és meglévő adatlapot sem ír felül.
   > A korábbi verziók egyetlen, minden cégre közös listát használtak. Ez
   > „Régi közös lista” fülként látszik; feldolgozáskor az ott már szereplő
   > személyek kérdés nélkül átkerülnek az adott cég listájába.
@@ -209,6 +213,16 @@ magát, és újraindul az új verzióval.
   ezért ékezetes mappanévvel is működik. Ha egy gépen ki van kapcsolva a
   8.3-as névgenerálás *és* ékezetes az útvonal, a csere elbukhat — ilyenkor a
   kézi csere segít.
+- **„Failed to load Python DLL” a `2026.08.03.2`-ről való frissítés után**:
+  egyszeri, ártalmatlan hibaablak. A régi verzió frissítője a saját
+  ideiglenes mappájára mutató PyInstaller-változókat adta tovább az
+  újraindított programnak. A csere ilyenkor már megtörtént: OK, majd indítsd
+  el újra a programot. A `2026.10.01.2` óta a frissítő tiszta környezettel
+  indítja az új verziót, így ez többé nem fordul elő.
+- **Ékezetes mappa a `2026.08.03.2`-es verzióval**: annak a frissítője ékezetes
+  útvonalon nem tudja lecserélni magát (a program bezárul, a régi verzió
+  marad). Ilyenkor egyszer kézzel kell kicserélni az `.exe`-t; onnantól az
+  automatikus frissítés ékezetes mappában is működik.
 
 A cserét egy ideiglenes batch végzi, ami megvárja, míg a futó példány kilép.
 Ha a csere nem sikerül, **az eredeti `.exe` visszaáll** — a program nem marad

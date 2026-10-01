@@ -135,6 +135,9 @@ FIREBASE_CONSOLE_URL = 'https://console.firebase.google.com/'
 # A Személyek nézet füle a régi, minden cégre közös személylistának.
 LEGACY_PERSONS_TAB = '📦 Régi közös lista'
 
+# Az ismeretlen-személy dialógus jelzése: a hátralévőket se kérdezze meg.
+SKIP_ALL = object()
+
 
 def default_archive_dir():
     """A kimeneti fájlok archívuma.
@@ -648,6 +651,7 @@ class App:
     def ask_company_dialog(self, filename):
         result = {'company': None}
         dlg = tk.Toplevel(self.root)
+        dlg.transient(self.root)  # mindig a főablak fölött marad
         dlg.title('Cég kiválasztása')
         dlg.configure(bg=COLORS['card'])
         dlg.grab_set()
@@ -726,17 +730,24 @@ class App:
 
     def _load_context_work(self, ctx):
         """A cég személyei, a régi közös személylista és a cég adott havi előzményei."""
-        result = {'persons': {}, 'legacy_persons': {}, 'history': []}
+        result = {'online': False, 'persons': {}, 'legacy_persons': {}, 'history': []}
         if not self.store:
             return result
         online, _ = self._try_sign_in()
         if not online:
             return result
-        for key, company in (('persons', ctx['company']), ('legacy_persons', None)):
-            try:
-                result[key] = self.store.load_persons(company)
-            except Exception:
-                result[key] = {}
+        try:
+            result['persons'] = self.store.load_persons(ctx['company'])
+            # Csak akkor kérdezünk és mentünk személyt, ha a cég listáját
+            # ténylegesen be tudtuk olvasni — különben mindenki ismeretlennek
+            # látszana, és a válaszok felülírnák a meglévő adatlapokat.
+            result['online'] = True
+        except Exception:
+            result['persons'] = {}
+        try:
+            result['legacy_persons'] = self.store.load_persons(None)
+        except Exception:
+            result['legacy_persons'] = {}
         try:
             result['history'] = [
                 row for row in self.store.load_history(ctx['company'])
@@ -749,6 +760,7 @@ class App:
         loaded = loaded or {}
         ctx['persons'] = dict(loaded.get('persons') or {})
         ctx['legacy_persons'] = loaded.get('legacy_persons') or {}
+        ctx['persons_online'] = bool(loaded.get('online'))
 
         previous = loaded.get('history') or []
         if previous and not self._confirm_reprocess(ctx, previous):
@@ -781,6 +793,18 @@ class App:
             icon='warning')
 
     def _process_file_check_persons(self, ctx):
+        if not ctx.get('persons_online'):
+            # Kapcsolat nélkül a cég személylistája nem olvasható, és a beírt
+            # adatokat menteni sem tudnánk: minden dolgozóra feleslegesen
+            # rákérdeznénk. Az adatlapok ilyenkor kitöltetlenek maradnak.
+            self.log('A személylista nem érhető el: a személyi adatlapok '
+                     'kitöltetlenek maradnak, és senkire nem kérdezünk rá.')
+            ctx['new_persons'] = []
+            self.run_async(
+                lambda: self._process_file_async(ctx),
+                lambda result, error: self._process_file_finish(ctx, result, error),
+                'Feldolgozás és mentés...')
+            return
         persons = ctx['persons']
         legacy = ctx['legacy_persons']
         all_entries = ctx['current_entries'] + ctx['future_entries']
@@ -794,6 +818,10 @@ class App:
 
         new_persons = []
         adopted = 0
+        asked = 0
+        skip_rest = False
+        # ennyi kérdés jön (a régi listából átvettekre nem kérdezünk)
+        to_ask = sum(1 for e in unknown_entries if generate.taj_key(e['taj']) not in legacy)
         for entry in unknown_entries:
             key = generate.taj_key(entry['taj'])
             if key in legacy:
@@ -801,8 +829,19 @@ class App:
                 # átvesszük ennek a cégnek a listájába.
                 person_data = dict(legacy[key])
                 adopted += 1
+            elif skip_rest:
+                # „Összes kihagyása” után már nem kérdezünk — a régi listából
+                # átvehetőket (fenti ág) viszont továbbra is átvesszük.
+                continue
             else:
-                person_data = self._ask_person_dialog(entry['nev'], entry['taj'])
+                person_data = self._ask_person_dialog(
+                    entry['nev'], entry['taj'], position=(asked + 1, to_ask))
+                asked += 1
+                if person_data is SKIP_ALL:
+                    skip_rest = True
+                    self.log(f'{to_ask - asked + 1} ismeretlen személy kihagyva — az '
+                             'adatlapjuk kitöltetlen marad, legközelebb újra rákérdezünk.')
+                    continue
             if person_data:
                 persons[key] = person_data
                 new_persons.append(person_data)
@@ -1062,8 +1101,9 @@ class App:
             messagebox.showwarning(
                 'Nincs kapcsolat',
                 'A Firestore nem érhető el. A statisztika a korábbi hónapokból '
-                'átvitt rekordok NÉLKÜL készül el, és a jövő hónapra szóló '
-                'rekordok nem kerülnek mentésre!')
+                'átvitt rekordok NÉLKÜL és kitöltetlen személyi adatlapokkal '
+                'készül el, a jövő hónapra szóló rekordok pedig nem kerülnek '
+                'mentésre!')
         if result.get('firestore_warning'):
             messagebox.showwarning(
                 'Firestore hiba',
@@ -1418,6 +1458,7 @@ class App:
 
     def open_update(self):
         dlg = tk.Toplevel(self.root)
+        dlg.transient(self.root)  # mindig a főablak fölött marad
         dlg.title('Frissítés')
         dlg.configure(bg=COLORS['card'])
         dlg.grab_set()
@@ -1619,10 +1660,20 @@ class App:
             raise RuntimeError(str(e)) from e
 
     def open_setup_guide(self):
+        # A Beállítások ablakból nyílik: annak a tetején maradjon, és bezárás
+        # után adja vissza neki a fókuszt — különben a Beállítások nyitva
+        # maradna, miközben a főablak újra kattinthatóvá válik.
+        owner = self.root.grab_current() or self.root
         dlg = tk.Toplevel(self.root)
         dlg.title('Útmutató — Firebase adatok beszerzése')
         dlg.configure(bg=COLORS['card'])
+        dlg.transient(owner)
         dlg.grab_set()
+
+        def close():
+            dlg.destroy()
+            if owner is not self.root and owner.winfo_exists():
+                owner.grab_set()
         dlg.geometry('620x560')
         dlg.minsize(480, 360)
 
@@ -1705,11 +1756,13 @@ class App:
 
         text.configure(state='disabled')
 
-        ttk.Button(dlg, text='Bezárás', style='Secondary.TButton', command=dlg.destroy).pack(pady=(0, 16))
-        dlg.bind('<Escape>', lambda e: dlg.destroy())
+        ttk.Button(dlg, text='Bezárás', style='Secondary.TButton', command=close).pack(pady=(0, 16))
+        dlg.bind('<Escape>', lambda e: close())
+        dlg.protocol('WM_DELETE_WINDOW', close)
 
     def open_settings(self):
         dlg = tk.Toplevel(self.root)
+        dlg.transient(self.root)  # mindig a főablak fölött marad
         dlg.title('Beállítások')
         dlg.configure(bg=COLORS['card'])
         dlg.grab_set()
@@ -1843,6 +1896,7 @@ class App:
 
     def confirm_reset(self):
         dlg = tk.Toplevel(self.root)
+        dlg.transient(self.root)  # mindig a főablak fölött marad
         dlg.title('Nullázás megerősítése')
         dlg.configure(bg=COLORS['card'])
         dlg.grab_set()
@@ -2115,6 +2169,7 @@ class App:
 
     def _open_person_edit_dialog(self, company, person):
         dlg = tk.Toplevel(self.root)
+        dlg.transient(self.root)  # mindig a főablak fölött marad
         dlg.title('Személy szerkesztése')
         dlg.configure(bg=COLORS['card'])
         dlg.grab_set()
@@ -2174,16 +2229,21 @@ class App:
         dlg.bind('<Return>', lambda e: do_save())
         dlg.bind('<Escape>', lambda e: dlg.destroy())
 
-    def _ask_person_dialog(self, nev, taj):
+    def _ask_person_dialog(self, nev, taj, position=None):
+        """Adatlap bekérése. Visszatérés: dict, None (kihagyva) vagy SKIP_ALL."""
         result = {'data': None}
         dlg = tk.Toplevel(self.root)
+        dlg.transient(self.root)  # mindig a főablak fölött marad
         dlg.title('Ismeretlen személy')
         dlg.configure(bg=COLORS['card'])
         dlg.grab_set()
         dlg.resizable(False, False)
 
         ttk.Label(dlg, text='👤', font=('Segoe UI', 22), background=COLORS['card']).pack(pady=(18, 4))
-        ttk.Label(dlg, text='Ismeretlen személy', background=COLORS['card'], font=FONT_BOLD).pack()
+        heading = 'Ismeretlen személy'
+        if position and position[1] > 1:
+            heading += f'  ({position[0]} / {position[1]})'
+        ttk.Label(dlg, text=heading, background=COLORS['card'], font=FONT_BOLD).pack()
         ttk.Label(dlg, text=f'{nev}  •  TAJ: {taj}', background=COLORS['card'],
                   foreground=COLORS['muted'], font=FONT_BASE).pack(pady=(2, 4))
         ttk.Label(dlg, text='Add meg az adatait, vagy hagyd üresen és nyomj OK-t.\n'
@@ -2218,9 +2278,24 @@ class App:
             result['data'] = {'taj': taj, 'nev': nev, **values}
             dlg.destroy()
 
+        def do_skip_all():
+            result['data'] = SKIP_ALL
+            dlg.destroy()
+
         btns = ttk.Frame(dlg, style='Card.TFrame')
-        btns.pack(pady=(8, 20))
-        ttk.Button(btns, text='OK', style='Accent.TButton', command=do_ok).pack(padx=6)
+        btns.pack(pady=(8, 6))
+        remaining = position[1] - position[0] + 1 if position else 1
+        if remaining > 1:
+            ttk.Button(btns, text=f'Összes kihagyása ({remaining})', style='Secondary.TButton',
+                       command=do_skip_all).pack(side='left', padx=6)
+        ttk.Button(btns, text='OK', style='Accent.TButton', command=do_ok).pack(side='left', padx=6)
+        if remaining > 1:
+            ttk.Label(dlg, text='A kihagyott személyek adatlapja kitöltetlen marad, '
+                                'és legközelebb újra rákérdezünk.',
+                      background=COLORS['card'], foreground=COLORS['muted'], font=FONT_BASE,
+                      wraplength=360, justify='center').pack(padx=24, pady=(0, 16))
+        else:
+            btns.pack_configure(pady=(8, 20))
         dlg.bind('<Return>', lambda e: do_ok())
         dlg.bind('<Escape>', lambda e: dlg.destroy())
         dlg.wait_window()
