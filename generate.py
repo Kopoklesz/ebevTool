@@ -139,6 +139,32 @@ def taj_key(taj):
     return digits or str(taj or '').strip()
 
 
+# Az adóazonosítóra ugyanaz a normalizálás érvényes.
+ado_key = taj_key
+
+
+def find_person(persons, adoazonosito, taj):
+    """(kulcs, személy) a megadott dolgozóhoz, vagy (None, None).
+
+    Az elsődleges azonosító az adóazonosító: azt ritkábban írják el, mint a
+    TAJ-számot. A TAJ csak tartalék — az adóazonosító nélkül rögzített (régi)
+    adatlapokhoz, illetve ha a dolgozónak nincs adóazonosítója. Ha egy
+    adatlapon VAN adóazonosító, de más, mint a keresett, az másik személy,
+    akkor is, ha a TAJ egyezik.
+    """
+    a_key, t_key = ado_key(adoazonosito), taj_key(taj)
+    if a_key:
+        for key, p in persons.items():
+            if ado_key(p.get('adoazonosito')) == a_key:
+                return key, p
+    if t_key:
+        for key, p in persons.items():
+            p_ado = ado_key(p.get('adoazonosito'))
+            if taj_key(p.get('taj')) == t_key and (not p_ado or not a_key):
+                return key, p
+    return None, None
+
+
 def entry_key(entry):
     return f"{entry['adoazonosito']}|{serial_to_iso(entry['start_serial'])}|{entry['munkanapok']}"
 
@@ -194,6 +220,131 @@ def is_torles(row, fmt=DEFAULT_FORMAT):
 
 def is_hibas(row, fmt=DEFAULT_FORMAT):
     return bool(hiba_value(row, fmt))
+
+
+# --- visszavonások ---
+#
+# Nem tudjuk biztosan, hogyan jelenik meg a NAV-exportban egy visszavont
+# bejelentés: (a) csak a visszavonó sor marad, (b) az eredeti 'Új' sor is
+# megmarad mellette, vagy (c) a visszavonás egy későbbi havi exportban jön.
+# A szabály mindhárom esetben helyes: egy (adóazonosító, kezdő nap) kulcsú
+# bejelentés érvénytelen, ha UTÁNA ugyanerre a kulcsra visszavonás jött. (a)
+# esetben nincs mit párosítani, így semmi nem változik; a visszavonás utáni
+# újbóli 'Új' bejelentés pedig érvényes — a visszavonás előtti viszont nem,
+# akkor sem, ha más munkanapszámmal jelentették be.
+#
+# A régi 'e-bev' formátumban a 'törlés' jelölés magát a sort jelöli töröltnek
+# (nem egy másik bejelentést von vissza), ezért ott nincs visszavonási esemény.
+
+WITHDRAW_WORDS = ('visszavon', 'törl', 'torl')
+
+_TIME_RE = re.compile(r'(\d{1,2}):(\d{2})(?::(\d{2}))?')
+
+
+def _event_time(value):
+    """A bejelentés időpontja (datetime) a rendezéshez, vagy None."""
+    if isinstance(value, datetime):
+        return value
+    serial = date_str_to_serial(value)
+    if serial is None:
+        return None
+    dt = serial_to_date(serial)
+    text = str(value)
+    date_match = _DATE_RE.match(text)
+    match = _TIME_RE.search(text, date_match.end()) if date_match else None
+    if match:
+        h, m, s = (int(g or 0) for g in match.groups())
+        try:
+            dt = dt.replace(hour=h, minute=m, second=s)
+        except ValueError:
+            pass
+    return dt
+
+
+def row_event(row, fmt=DEFAULT_FORMAT):
+    """A sor eseménytípusa: 'new' (érvényes bejelentés), 'withdraw'
+    (visszavonás/törlés), 'other' (pl. módosítás, vagy a régi formátum
+    törölt sora) vagy None (hibás sor)."""
+    if is_hibas(row, fmt):
+        return None
+    flag = torles_value(row, fmt)
+    if not flag:
+        return 'new'
+    if fmt.torles and fmt.torles['mode'] == 'marker':
+        return 'other'
+    lowered = flag.lower()
+    return 'withdraw' if any(w in lowered for w in WITHDRAW_WORDS) else 'other'
+
+
+def withdrawal_key(adoazonosito, start_serial, taj=''):
+    """A bejelentés kulcsa: adóazonosító (híján TAJ) + kezdő nap, vagy None."""
+    ident = ado_key(adoazonosito) or (('taj:' + taj_key(taj)) if taj_key(taj) else '')
+    return f'{ident}|{start_serial}' if ident and start_serial is not None else None
+
+
+def _parse_munkanapok(value):
+    try:
+        n = int(float(str(value).strip().replace(',', '.')))
+        return n if n >= 1 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _row_sort_key(row, fmt, order, index):
+    """Rendezőkulcs: bejelentés ideje, majd a fájl (hónap) és a sor sorrendje."""
+    when = _event_time(_cell_value(row, fmt.col('bejelentes')))
+    return (when or datetime.min, order, index)
+
+
+def row_events(data_rows, fmt=DEFAULT_FORMAT, order=0):
+    """A sorok eseményei: (rendezőkulcs, kulcs, típus, név, kezdő serial, munkanapok)."""
+    events = []
+    for i, r in enumerate(data_rows):
+        kind = row_event(r, fmt)
+        if kind not in ('new', 'withdraw'):
+            continue
+        start = date_str_to_serial(_cell_value(r, fmt.col('kezdes')))
+        key = withdrawal_key(cell_text(r, fmt.col('adoazonosito')), start,
+                             cell_text(r, fmt.col('taj')))
+        if key is None:
+            continue
+        events.append((_row_sort_key(r, fmt, order, i), key, kind,
+                       cell_text(r, fmt.col('nev')), start,
+                       _parse_munkanapok(_cell_value(r, fmt.col('munkanapok')))))
+    return events
+
+
+def withdrawal_cutoffs(events):
+    """{kulcs: (a legutolsó visszavonás rendezőkulcsa, név, kezdő serial)} —
+    a kulcs minden ennél korábbi bejelentése érvénytelen."""
+    cutoffs = {}
+    for sort_key, key, kind, nev, start, _ in events:
+        if kind == 'withdraw' and (key not in cutoffs or sort_key > cutoffs[key][0]):
+            cutoffs[key] = (sort_key, nev, start)
+    return cutoffs
+
+
+def valid_registrations(events):
+    """Hónapokon átívelő kiértékelés (munkanapló): {kulcs: munkanapszámok}
+    azokra a kulcsokra, amikre volt visszavonás — az utolsó visszavonás után
+    újra bejelentett munkanapszámok (üres halmaz: végleg visszavonva)."""
+    cutoffs = withdrawal_cutoffs(events)
+    valid = {key: set() for key in cutoffs}
+    for sort_key, key, kind, nev, start, munkanapok in events:
+        if key in cutoffs and kind == 'new' and sort_key > cutoffs[key][0]:
+            valid[key].add(munkanapok or 1)
+    return valid
+
+
+def entry_withdrawal_key(entry):
+    return withdrawal_key(entry['adoazonosito'], entry['start_serial'], entry.get('taj', ''))
+
+
+def is_withdrawn(entry, withdrawn):
+    """Igaz, ha a bejegyzés kulcsára van visszavonás a megadott kulcsok közt
+    (egy korábbi fájlból áthozott bejegyzéshez: azt bármely itteni visszavonás
+    érvényteleníti, hisz a visszavonás később történt)."""
+    return entry_withdrawal_key(entry) in withdrawn
 
 
 def detect_format(sheet_title, header):
@@ -252,17 +403,26 @@ def _cell_value(row, idx):
     return row[idx] if idx is not None and len(row) > idx else None
 
 
-def extract_entries(data_rows, fmt=DEFAULT_FORMAT, problems=None):
+def extract_entries(data_rows, fmt=DEFAULT_FORMAT, problems=None, withdrawn=None):
     """A feldolgozandó bejegyzések kinyerése.
 
     A 'problems' listába (ha megadjuk) kerül minden sor, amit nem lehetett
     rendesen értelmezni, (név, leírás) párként — ezeket a hívónak kell
     jeleznie, különben a statisztika csendben hiányos lenne.
+
+    A 'withdrawn' szótárba (ha megadjuk) kerülnek a fájlban szereplő
+    visszavonások kulcsai {kulcs: (név, kezdő serial)} — a hívó ezekkel a
+    korábbi hónapokból átvitt rekordokat szűri. Az ugyanebben a fájlban a
+    visszavonás ELŐTT tett 'Új' bejelentések itt kimaradnak.
     """
     if problems is None:
         problems = []
-    active_rows = [r for r in data_rows
-                   if not is_torles(r, fmt) and not is_hibas(r, fmt)]
+    active = [(i, r) for i, r in enumerate(data_rows)
+              if not is_torles(r, fmt) and not is_hibas(r, fmt)]
+    active_rows = [r for _, r in active]
+    cutoffs = withdrawal_cutoffs(row_events(data_rows, fmt))
+    if withdrawn is not None:
+        withdrawn.update({k: (nev, start) for k, (_, nev, start) in cutoffs.items()})
 
     c_bejelentes = fmt.col('bejelentes')
     c_kezdes = fmt.col('kezdes')
@@ -278,7 +438,7 @@ def extract_entries(data_rows, fmt=DEFAULT_FORMAT, problems=None):
 
     current_entries = []
     future_entries = []
-    for r in active_rows:
+    for i, r in active:
         nev = cell_text(r, fmt.col('nev'))
         start_serial = date_str_to_serial(_cell_value(r, c_kezdes))
         if start_serial is None:
@@ -300,6 +460,9 @@ def extract_entries(data_rows, fmt=DEFAULT_FORMAT, problems=None):
             'start_serial': start_serial,
             'munkanapok': munkanapok,
         }
+        cutoff = cutoffs.get(entry_withdrawal_key(entry))
+        if cutoff and _row_sort_key(r, fmt, 0, i) < cutoff[0]:
+            continue  # később visszavonták
         if current_month_serial and serial_to_month_serial(start_serial) > current_month_serial:
             future_entries.append(entry)
         else:
@@ -477,7 +640,7 @@ def generate_output(input_path, header, data_rows, entries, output_path=None,
     ws_nev = wb_out.create_sheet('Név Szerint')
     for nev in sorted_names:
         info = by_name[nev]
-        p = persons.get(taj_key(info['taj']), {})
+        p = find_person(persons, info['adoazonosito'], info['taj'])[1] or {}
         ws_nev.append(['név:', nev, '', '', ''])
         ws_nev.append(['szül.név', p.get('szul_nev', ''), '', '', ''])
         ws_nev.append(['anyja neve:', p.get('anya_neve', ''), '', '', ''])

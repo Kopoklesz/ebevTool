@@ -51,10 +51,20 @@ szereplő **foglalkoztatói adószám** alapján történik.
     ép marad** — semmi nem íródik felül csendben.
 - **Várakozási sor / Böngésző** nézet: a Firestore-ban tárolt rekordok
   dekódolt böngészése és manuális törlése.
-- **Személyek** nézet: TAJ-hoz kötött, titkosítva tárolt személyi adatok
-  (szül. név, anyja neve, szül. hely/idő, lakcím), **cégenként külön
+- **Személyek** nézet: **adóazonosítóhoz** kötött, titkosítva tárolt személyi
+  adatok (szül. név, anyja neve, szül. hely/idő, lakcím), **cégenként külön
   listában** (cégválasztó fülekkel; a széles táblázat vízszintesen
-  görgethető). Ismeretlen TAJ-nál a feldolgozás rákérdez (sorszámmal, pl.
+  görgethető). A személyt az adóazonosító azonosítja, mert azt ritkábban
+  írják el, mint a TAJ-számot: ha a TAJ eltér az adatlapon tárolttól, a
+  program figyelmeztet, de nem kérdez újra. A TAJ csak tartalék (adóazonosító
+  nélküli sornál, illetve a régi, csak TAJ-jal rögzített adatlapoknál — ezek
+  a következő feldolgozáskor automatikusan megkapják az adóazonosítót). Az
+  adóazonosító és a TAJ a szerkesztő ablakban javítható.
+  **Kereső**: név (ékezet nélkül is), adóazonosító vagy TAJ alapján egyszerre
+  keres az összes cég listájában, és megmutatja, mely cégeknél szerepel a
+  személy; dupla kattintás a cég sorára az adott cég fülére ugrik. A találatok
+  innen közvetlenül szerkeszthetők és törölhetők.
+  Ismeretlen személynél a feldolgozás rákérdez (sorszámmal, pl.
   `2 / 5`), és a `Név Szerint` lap adatlapjait a cég listájából tölti ki. Az
   **Összes kihagyása** gombbal a hátralévő kérdések egy kattintással
   átugorhatók: a kihagyottak bekerülnek a statisztikába, csak az adatlapjuk
@@ -63,6 +73,35 @@ szereplő **foglalkoztatói adószám** alapján történik.
   > A korábbi verziók egyetlen, minden cégre közös listát használtak. Ez
   > „Régi közös lista” fülként látszik; feldolgozáskor az ott már szereplő
   > személyek kérdés nélkül átkerülnek az adott cég listájába.
+- **Munkanapló** (Személyek → 📅 Munkanapló, vagy dupla katt a keresőben a
+  személy sorára): személyenként, cégenként a ledolgozott napok száma, első és
+  utolsó napja és havi bontásban a dátumok — Excelbe is menthető. Forrása a
+  havi statisztikák felhőben mentett tartalma, cég-hónaponként **csak a
+  legutolsó feldolgozásé**: ha egy javított fájlt töltenek fel újra (pl.
+  kihúztak belőle valakit), a korábbi verzió nem számít. A 2026.10.01 előtti
+  hónapok a **📥 Régi hónapok az archívumból** gombbal tölthetők be a helyi
+  archívum kimeneteiből (ugyanarra a hónapra több fájlnál a legújabb számít;
+  a várakozási sorhoz és az előzményekhez nem nyúl).
+- **Visszavonások**: egy (adóazonosító — híján TAJ —, kezdő nap) bejelentés
+  érvénytelen, ha utána ugyanerre visszavonás/törlés jött — akár ugyanabban a
+  fájlban, akár egy későbbi hónap fájljában. A visszavonás utáni újbóli „Új”
+  bejelentés érvényes (a visszavonás előtti nem, más munkanapszámmal sem). A
+  feldolgozás ezt naplózza, a sorban álló áthozott rekordot „visszavonva”
+  állapotúra teszi (nem törli, így a hónap javított fájllal újra
+  feldolgozva visszaállítható), a munkanapló pedig a korábbi hónapból is
+  kiveszi. A régi `e-bev` formátumban a „törlés” jelölés csak magát a sort
+  jelöli töröltnek, más bejelentést nem von vissza.
+- **Javított hónap újrafeldolgozása**: ha a következő hónapot már
+  feldolgozták, a megváltozott áthúzódó bejelentések régi változata akkor is
+  törlődik, és a program szól, hogy a későbbi hónapot is futtasd újra.
+- **🧹 Adatok ellenőrzése** (Személyek oldal): a már rögzített adatlapokra
+  egységesítési javaslatokat tesz (pl. `KOVÁCS ÉVA` → `Kovács Éva`,
+  `1234 BUDAPEST, FŐ UTCA 1.` → `1234 Budapest, Fő utca 1.`, dátum
+  `1990.01.05.` alakra) — csak a kijelöltek, megerősítés után kerülnek
+  mentésre. Külön listázza a problémákat: hibás ellenőrzőszámú adóazonosító
+  vagy TAJ, hiányzó adatok, ugyanaz az adóazonosító más névvel, ugyanaz a
+  TAJ más adóazonosítóval. A hibás ellenőrzőszámot a feldolgozás naplója és
+  a szerkesztő ablak is jelzi.
 - **Hibás sorok jelzése**: ha egy sor kezdő dátuma vagy munkanapszáma nem
   értelmezhető, a program a feldolgozás előtt felsorolja ezeket (a dátum
   lehet szöveg `ÉÉÉÉ.HH.NN.` / `ÉÉÉÉ-HH-NN` alakban vagy Excel-dátumcella).
@@ -260,7 +299,7 @@ kötve, más gépre vagy fiókba átmásolva olvashatatlanok, és csak a Beáll�
 ablakon keresztül szerkeszthetők.
 
 A Firestore-ban a **várakozási sor** (titkosítva, max. fél éves megőrzéssel), a
-**személyi adatlapok** (titkosítva, cégenként, TAJ-hoz kötve) és a feldolgozott hónapok
+**személyi adatlapok** (titkosítva, cégenként, adóazonosítóhoz kötve) és a feldolgozott hónapok
 **statisztika-tartalma** (titkosítva) tárolódik. Mindhármat ugyanaz a Fernet
 kulcs védi — ha ez elvész, az adatok visszafejthetetlenné válnak.
 
