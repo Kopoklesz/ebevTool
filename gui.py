@@ -5,6 +5,7 @@ import platform
 import shutil
 import sys
 import threading
+import unicodedata
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -39,7 +40,10 @@ except ImportError:
 from cryptography.fernet import Fernet
 import webbrowser
 
+import archive_import
 import generate
+import normalize
+import worklog
 import filename_utils
 import dpapi_crypto
 import updater
@@ -294,6 +298,8 @@ class App:
         self.update_available = None
 
         self.persons_state = {}
+        self.worklog_cache = None  # a munkanapló, első használatkor töltődik be
+        self.worklog_missing = {}
         self._init_store()
 
         root.title('ebevTool – Statisztika generálás')
@@ -730,7 +736,8 @@ class App:
 
     def _load_context_work(self, ctx):
         """A cég személyei, a régi közös személylista és a cég adott havi előzményei."""
-        result = {'online': False, 'persons': {}, 'legacy_persons': {}, 'history': []}
+        result = {'online': False, 'persons': {}, 'legacy_persons': {}, 'history': [],
+                  'processed_months': set()}
         if not self.store:
             return result
         online, _ = self._try_sign_in()
@@ -749,9 +756,11 @@ class App:
         except Exception:
             result['legacy_persons'] = {}
         try:
-            result['history'] = [
-                row for row in self.store.load_history(ctx['company'])
-                if row.get('year_month') == ctx['ym']]
+            history = self.store.load_history(ctx['company'])
+            result['history'] = [row for row in history if row.get('year_month') == ctx['ym']]
+            # a már feldolgozott hónapok: egy korábbi hónap javítása ezeket is érintheti
+            result['processed_months'] = {row.get('year_month') for row in history
+                                          if row.get('year_month')}
         except Exception:
             result['history'] = []
         return result
@@ -761,6 +770,7 @@ class App:
         ctx['persons'] = dict(loaded.get('persons') or {})
         ctx['legacy_persons'] = loaded.get('legacy_persons') or {}
         ctx['persons_online'] = bool(loaded.get('online'))
+        ctx['processed_months'] = loaded.get('processed_months') or set()
 
         previous = loaded.get('history') or []
         if previous and not self._confirm_reprocess(ctx, previous):
@@ -808,26 +818,48 @@ class App:
         persons = ctx['persons']
         legacy = ctx['legacy_persons']
         all_entries = ctx['current_entries'] + ctx['future_entries']
-        seen_taj = set()
+        seen = set()
         unknown_entries = []
+        # (adatlap, régi dokumentumazonosító): régi, TAJ-alapú adatlapok,
+        # amik most megkapják az adóazonosítót (és vele az új azonosítót)
+        upgraded = []
         for entry in all_entries:
-            key = generate.taj_key(entry.get('taj', ''))
-            if key and key not in persons and key not in seen_taj:
-                seen_taj.add(key)
+            ado, taj = entry.get('adoazonosito', ''), entry.get('taj', '')
+            ident = generate.ado_key(ado) or 'taj:' + generate.taj_key(taj)
+            if ident == 'taj:' or ident in seen:
+                continue
+            seen.add(ident)
+            key, person = generate.find_person(persons, ado, taj)
+            if person is None:
                 unknown_entries.append(entry)
+            elif generate.ado_key(ado) and not generate.ado_key(person.get('adoazonosito')):
+                updated = dict(person, adoazonosito=ado)
+                del persons[key]
+                persons[FirebaseStore.person_doc_id(updated)] = updated
+                upgraded.append((updated, key))
+            elif generate.taj_key(taj) and generate.taj_key(person.get('taj')) != generate.taj_key(taj):
+                # Az adóazonosító egyezik, a TAJ nem: valószínűleg elírás. A
+                # kimenetbe a fájl TAJ-a kerül, az adatlap nem változik.
+                self.log(f"Figyelem: {entry['nev']} ({ado}) — a fájlban a TAJ {taj}, "
+                         f"az adatlapon {person.get('taj') or '(üres)'}. Az adóazonosító "
+                         'alapján ugyanannak a személynek vettük; ha az adatlap a hibás, '
+                         'javítsd a Személyek oldalon.')
 
         new_persons = []
         adopted = 0
         asked = 0
         skip_rest = False
+        legacy_match = {id(e): generate.find_person(legacy, e['adoazonosito'], e['taj'])[1]
+                        for e in unknown_entries}
         # ennyi kérdés jön (a régi listából átvettekre nem kérdezünk)
-        to_ask = sum(1 for e in unknown_entries if generate.taj_key(e['taj']) not in legacy)
+        to_ask = sum(1 for e in unknown_entries if legacy_match[id(e)] is None)
         for entry in unknown_entries:
-            key = generate.taj_key(entry['taj'])
-            if key in legacy:
+            if legacy_match[id(entry)] is not None:
                 # A régi, közös személylistában már megvan: rákérdezés nélkül
                 # átvesszük ennek a cégnek a listájába.
-                person_data = dict(legacy[key])
+                person_data = dict(legacy_match[id(entry)])
+                if not generate.ado_key(person_data.get('adoazonosito')):
+                    person_data['adoazonosito'] = entry['adoazonosito']
                 adopted += 1
             elif skip_rest:
                 # „Összes kihagyása” után már nem kérdezünk — a régi listából
@@ -835,7 +867,8 @@ class App:
                 continue
             else:
                 person_data = self._ask_person_dialog(
-                    entry['nev'], entry['taj'], position=(asked + 1, to_ask))
+                    entry['nev'], entry['adoazonosito'], entry['taj'],
+                    position=(asked + 1, to_ask))
                 asked += 1
                 if person_data is SKIP_ALL:
                     skip_rest = True
@@ -843,13 +876,14 @@ class App:
                              'adatlapjuk kitöltetlen marad, legközelebb újra rákérdezünk.')
                     continue
             if person_data:
-                persons[key] = person_data
+                persons[FirebaseStore.person_doc_id(person_data)] = person_data
                 new_persons.append(person_data)
 
         if adopted:
             self.log(f'{adopted} személy adatai átvéve a régi közös listából '
                      f'a(z) {ctx["company"]} cég listájába.')
         ctx['new_persons'] = new_persons
+        ctx['upgraded_persons'] = upgraded
 
         self.run_async(
             lambda: self._process_file_async(ctx),
@@ -883,8 +917,20 @@ class App:
         self._log_flagged_rows(data_rows, fmt)
 
         row_problems = []
+        withdrawn = {}
         current_month_serial, current_entries, future_entries = \
-            generate.extract_entries(data_rows, fmt, problems=row_problems)
+            generate.extract_entries(data_rows, fmt, problems=row_problems, withdrawn=withdrawn)
+        seen_ids = set()
+        for e in current_entries + future_entries:
+            for value, check, what in ((e['adoazonosito'], normalize.valid_adoazonosito, 'adóazonosítója'),
+                                       (e['taj'], normalize.valid_taj, 'TAJ-száma')):
+                if value and (what, value) not in seen_ids and not check(value):
+                    seen_ids.add((what, value))
+                    self.log(f"FIGYELEM: {e['nev']} {what} ({value}) hibás ellenőrzőszámú — "
+                             'valószínűleg elírás.')
+        for nev, start in sorted(withdrawn.values(), key=lambda w: (w[1], w[0])):
+            self.log(f'Visszavonás: {nev}, kezdés {generate.serial_to_date(start):%Y.%m.%d.} '
+                     '— az előtte tett bejelentés nem számít bele.')
         if row_problems:
             for nev, problem in row_problems:
                 self.log(f'FIGYELEM: {nev or "(név nélkül)"}: {problem}')
@@ -929,7 +975,7 @@ class App:
             'path': path, 'filename': filename, 'company': company,
             'header': header, 'data_rows': data_rows, 'format': fmt,
             'current_entries': current_entries, 'future_entries': future_entries,
-            'ym': ym,
+            'ym': ym, 'withdrawn': withdrawn,
         }
 
     def _log_flagged_rows(self, data_rows, fmt):
@@ -967,24 +1013,68 @@ class App:
 
         carried = []
         to_consume = []
+        to_withdraw = []
+        to_restore = []
         stale = []
+        rerun_months = set()
         future_ids = {entry_doc_id(e) for e in ctx['future_entries']}
+        known_ids = {rec['id'] for rec in records}
+        for e in ctx['future_entries'] if online else ():
+            # Új vagy módosult áthúzódó rekord egy már feldolgozott hónapra:
+            # az a hónap csak újrafuttatva veszi fel.
+            e_ym = generate.serial_to_ym(generate.serial_to_month_serial(e['start_serial']))
+            if entry_doc_id(e) not in known_ids and e_ym in ctx.get('processed_months', ()):
+                rerun_months.add(e_ym)
+        withdrawn = ctx.get('withdrawn') or {}
         for rec in records:
             entry_ym = generate.serial_to_ym(
                 generate.serial_to_month_serial(rec['entry']['start_serial']))
-            if rec['status'] == 'pending' and entry_ym <= ctx['ym']:
+            status = rec['status']
+            # ennek a hónapnak a feldolgozása dönt róla: függő rekord, vagy amit
+            # egy korábbi futás ebben a hónapban használt fel / vont vissza
+            ours = status == 'pending' or (status in ('consumed', 'withdrawn')
+                                           and rec['consumed_in'] == ctx['ym'])
+            when = f"{generate.serial_to_date(rec['entry']['start_serial']):%Y.%m.%d.}"
+            if ours and generate.is_withdrawn(rec['entry'], withdrawn):
+                # Egy korábbi hónapból áthozott bejelentést ez a fájl visszavon:
+                # nem számít bele. Nem töröljük, csak megjelöljük — így ha a
+                # hónapot javított fájllal újra feldolgozzák, visszaállítható.
+                if status != 'withdrawn':
+                    to_withdraw.append((rec['id'], rec.get('version')))
+                logs.append(('text', f"Áthozott bejelentés visszavonva: {rec['entry']['nev']}, "
+                                     f"kezdés {when}"))
+                continue
+            if status == 'withdrawn' and ours:
+                # Korábban ebben a hónapban visszavonták, a mostani fájl már nem:
+                # úgy kezeljük, mintha még függőben lenne.
+                if entry_ym <= ctx['ym']:
+                    carried.append(rec['entry'])
+                    to_consume.append((rec['id'], rec.get('version')))
+                else:
+                    to_restore.append((rec['id'], rec.get('version')))
+            elif status == 'pending' and entry_ym <= ctx['ym']:
                 carried.append(rec['entry'])
                 # A beolvasáskori verzióval együtt: így az írás feltételes lesz,
                 # és kiderül, ha közben más felhasználta ugyanezt a rekordot.
                 to_consume.append((rec['id'], rec.get('version')))
-            elif rec['status'] == 'consumed' and rec['consumed_in'] == ctx['ym']:
+            elif status == 'consumed' and rec['consumed_in'] == ctx['ym']:
                 carried.append(rec['entry'])
-            elif (rec['status'] == 'pending' and rec.get('source_ym') == ctx['ym']
+            elif status == 'consumed' and generate.is_withdrawn(rec['entry'], withdrawn):
+                # Egy már lezárt hónap statisztikájában szerepel: azt ez nem
+                # módosítja (az a hónap a saját fájljából készül), csak jelezzük.
+                logs.append(('text', f"Visszavonás egy lezárt hónapra ({rec['consumed_in']}): "
+                                     f"{rec['entry']['nev']}, kezdés {when} — a munkanapló "
+                                     'már nem számolja, a havi statisztika nem változik.'))
+            elif (status in ('pending', 'consumed', 'withdrawn') and rec.get('source_ym') == ctx['ym']
                   and rec['id'] not in future_ids):
                 # Egy korábbi feldolgozás tette a sorba ugyanebből a hónapból,
                 # de az új (javított) fájlban már nincs benne: törölni kell,
                 # különben jövő hónapban nem létező munkanapként számítana be.
+                # Akkor is, ha egy későbbi hónap már felhasználta: annak a
+                # statisztikája így elavult, újra kell futtatni (lásd lent).
                 stale.append((rec['id'], rec.get('version')))
+                if rec['status'] == 'consumed' and rec.get('consumed_in'):
+                    rerun_months.add(rec['consumed_in'])
 
         entries = generate.merge_entries(ctx['current_entries'], carried)
         logs.append(('text', f"Rekordok a fájlból: {len(ctx['current_entries'])}, átvitt: {len(carried)}, "
@@ -998,6 +1088,14 @@ class App:
                     logs.append(('text', f'Személy mentése Firestore-ba sikertelen: {e}'))
             logs.append(('text', f"{len(ctx['new_persons'])} új személy elmentve "
                                  f"a(z) {ctx['company']} cég listájába."))
+        if online and ctx.get('upgraded_persons'):
+            for person, old_doc_id in ctx['upgraded_persons']:
+                try:
+                    self.store.save_person(ctx['company'], person, old_doc_id=old_doc_id)
+                except Exception as e:
+                    logs.append(('text', f'Személy mentése Firestore-ba sikertelen: {e}'))
+            logs.append(('text', f"{len(ctx['upgraded_persons'])} korábbi adatlap kiegészítve "
+                                 'az adóazonosítóval.'))
 
         output_file = generate.generate_output(
             ctx['path'], ctx['header'], ctx['data_rows'], entries,
@@ -1044,13 +1142,15 @@ class App:
                                            ctx['ym'], ctx['filename'],
                                            history_extra=history_extra,
                                            history_id=history_id,
-                                           stale_ids=stale)
+                                           stale_ids=stale, withdraw_ids=to_withdraw,
+                                           restore_ids=to_restore)
                 deleted = self.store.cleanup_expired(ctx['company'])
                 if deleted:
                     logs.append(('text', f'Takarítás: {deleted} lejárt rekord véglegesen törölve.'))
                 logs.append(('text', f"Várakozási sor frissítve ({len(ctx['future_entries'])} mentve, "
                                      f"{len(to_consume)} felhasználva"
                                      + (f", {len(stale)} elavult törölve" if stale else '')
+                                     + (f", {len(to_withdraw)} visszavonva" if to_withdraw else '')
                                      + ")."))
             except ConflictError:
                 # Valaki más ugyanezeket a rekordokat közben felhasználta. A
@@ -1071,10 +1171,18 @@ class App:
                 firestore_warning = str(e)
                 logs.append(('text', f'Firestore írás sikertelen: {e}'))
 
+        if conflict or firestore_warning or no_connection:
+            rerun_months = set()
+        if rerun_months:
+            logs.append(('text', 'FIGYELEM: ez a javítás a már feldolgozott '
+                                 f"{', '.join(sorted(rerun_months))} hónap(ok)at is érinti — "
+                                 'azokat is dolgozd fel újra.'))
         return {'logs': logs, 'no_connection': no_connection,
-                'firestore_warning': firestore_warning, 'conflict': conflict}
+                'firestore_warning': firestore_warning, 'conflict': conflict,
+                'rerun_months': sorted(rerun_months)}
 
     def _process_file_finish(self, ctx, result, error):
+        self.worklog_cache = None
         if error:
             self.log(f'HIBA: {error}')
             messagebox.showerror('Hiba', f'A feldolgozás nem sikerült:\n{error}')
@@ -1109,6 +1217,15 @@ class App:
                 'Firestore hiba',
                 f"A statisztika elkészült, de a várakozási sor frissítése "
                 f"nem sikerült:\n{result['firestore_warning']}")
+        if result.get('rerun_months'):
+            months = ', '.join(result['rerun_months'])
+            messagebox.showwarning(
+                'Későbbi hónapot is újra kell futtatni',
+                f"Ebben a fájlban változtak a(z) {months} hónapra áthúzódó "
+                f"bejelentések, de azt a hónapot már feldolgozták.\n\n"
+                f"A várakozási sort kijavítottuk — dolgozd fel újra a(z) {months} "
+                f"havi fájlt is, különben annak a statisztikája a régi adatokat "
+                f"tartalmazza.")
 
     # --- Előzmények nézet (beágyazott, nem külön ablak) ---
 
@@ -1220,9 +1337,10 @@ class App:
             # Tartaléknak a régi közös lista szolgál — egy régi hónap
             # személyei még csak abban lehetnek; a cég saját adata erősebb.
             persons = {}
-            for source in (None, company):
+            for source in (company, None):
                 try:
-                    persons.update(self.store.load_persons(source))
+                    for doc_id, person in self.store.load_persons(source).items():
+                        persons.setdefault(doc_id, person)
                 except Exception:
                     pass
             # output_path megadva, ezért az első paraméter (input_path) nem
@@ -1324,7 +1442,8 @@ class App:
             node = tree.insert('', 'end', text=ym, open=True, tags=('odd' if i % 2 else 'even',))
             for rec in sorted(groups[ym], key=lambda r: r['entry']['nev'].lower()):
                 e = rec['entry']
-                status = 'függőben' if rec['status'] == 'pending' else 'felhasználva'
+                status = {'pending': 'függőben', 'withdrawn': 'visszavonva'}.get(
+                    rec['status'], 'felhasználva')
                 tree.insert(node, 'end', iid=f"{rec['id']}",
                             text=e['nev'],
                             values=(generate.serial_to_iso(e['start_serial']),
@@ -1908,7 +2027,7 @@ class App:
         items = ('•  Helyi alias-cache (aliases.json)\n'
                  '•  Az állapot napló tartalma\n'
                  '•  A Firestore teljes várakozási sora és előzményei\n'
-                 '   (MINDEN ismert cégnél)\n'
+                 '   (MINDEN ismert cégnél), az archívumból betöltött munkanapló\n'
                  '•  A Firestore-ban tárolt összes személyes profil')
         ttk.Label(dlg, text=items, background=COLORS['card'], foreground=COLORS['muted'],
                   justify='left', font=FONT_BASE).pack(padx=24, pady=(8, 4), anchor='w')
@@ -1950,6 +2069,7 @@ class App:
             self.store.delete_all_history(c)
             self.store.delete_all_aliases(c)
             self.store.delete_all_persons(c)
+            self.store.delete_all_worklog_imports(c)
 
         def work():
             online, err = self._try_sign_in()
@@ -1967,6 +2087,7 @@ class App:
         self.run_async(work, self._on_reset_done, 'Nullázás folyamatban...')
 
     def _on_reset_done(self, result, error):
+        self.worklog_cache = None
         filename_utils.reset_local_aliases()
         self.status.configure(state='normal')
         self.status.delete('1.0', 'end')
@@ -2001,6 +2122,8 @@ class App:
 
     def show_persons(self):
         self._activate_nav('persons')
+        # a munkanapló is frissüljön (más gépen közben feldolgozott hónapok)
+        self.worklog_cache = None
         page = self.pages['persons']
         page.tkraise()
         if not self.store:
@@ -2044,28 +2167,66 @@ class App:
                       'Generáláskor a rendszer rákérdez az ismeretlen személyekre.')
             return
 
+        # szerkesztés/törlés utáni újratöltéskor a keresés megmarad
+        old_search = self.persons_state.get('search_var')
+        try:
+            previous_query = old_search.get() if old_search else ''
+        except tk.TclError:
+            previous_query = ''
+
         self._clear_body(page)
         labels = [label for label, _ in tabs]
         company_of = dict(tabs)
 
+        tools_frame = ttk.Frame(page.body)
+        tools_frame.pack(side='bottom', fill='x', pady=(8, 0))
+        ttk.Button(tools_frame, text='🧹  Adatok ellenőrzése', style='Secondary.TButton',
+                   command=self.open_data_check).pack(side='left')
+        ttk.Button(tools_frame, text='📥  Régi hónapok az archívumból', style='Secondary.TButton',
+                   command=self.import_archive).pack(side='left', padx=8)
+        ttk.Label(tools_frame, text='Tipp: Shift + egérgörgő = oldalra görgetés',
+                  style='Muted.TLabel').pack(side='right')
+
         btns_frame = ttk.Frame(page.body)
         btns_frame.pack(side='bottom', fill='x', pady=(10, 0))
+        ttk.Button(btns_frame, text='📅  Munkanapló', style='Accent.TButton',
+                   command=self._show_selected_worklog).pack(side='left')
         ttk.Button(btns_frame, text='✏  Szerkesztés', style='Secondary.TButton',
-                   command=self._edit_selected_person).pack(side='left')
+                   command=self._edit_selected_person).pack(side='left', padx=(8, 0))
         ttk.Button(btns_frame, text='🗑  Törlés', style='Secondary.TButton',
                    command=self._delete_selected_person).pack(side='left', padx=8)
         ttk.Button(btns_frame, text='🔄  Frissítés', style='Secondary.TButton',
                    command=self.show_persons).pack(side='left')
-        ttk.Label(btns_frame, text='Tipp: Shift + egérgörgő = oldalra görgetés',
-                  style='Muted.TLabel').pack(side='right')
 
-        frames, select, switcher_state = self._build_company_switcher(page.body, labels)
+        # --- kereső: minden cég listájában egyszerre keres ---
+        search_bar = ttk.Frame(page.body)
+        search_bar.pack(fill='x', pady=(0, 12))
+        ttk.Label(search_bar, text='🔍  Keresés:', font=FONT_BOLD,
+                  background=COLORS['bg']).pack(side='left')
+        search_var = tk.StringVar()
+        search_entry = ttk.Entry(search_bar, textvariable=search_var, width=36, font=FONT_BASE)
+        search_entry.pack(side='left', padx=(8, 8), ipady=3)
+        ttk.Button(search_bar, text='✕', style='Secondary.TButton', width=3,
+                   command=lambda: search_var.set('')).pack(side='left')
+        search_info = ttk.Label(search_bar, text='név, adóazonosító vagy TAJ — az összes cégben',
+                                style='Muted.TLabel')
+        search_info.pack(side='left', padx=(12, 0))
+        search_entry.bind('<Escape>', lambda e: search_var.set(''))
+
+        browse = ttk.Frame(page.body)
+        browse.pack(fill='both', expand=True)
+        results = ttk.Frame(page.body, style='Card.TFrame')
+
+        frames, select, switcher_state = self._build_company_switcher(browse, labels)
         self.persons_state = {'trees': {}, 'data': data, 'company_of': company_of,
-                              'switcher_state': switcher_state, 'select': select}
+                              'switcher_state': switcher_state, 'select': select,
+                              'search_var': search_var, 'results_items': {},
+                              'results_people': {}}
 
-        cols = ('taj', 'szul_nev', 'anya_neve', 'szul_hely_ido', 'lakcim')
+        cols = ('adoazonosito', 'taj', 'szul_nev', 'anya_neve', 'szul_hely_ido', 'lakcim')
         col_spec = {
             '#0': ('Név', 160),
+            'adoazonosito': ('Adóazonosító', 110),
             'taj': ('TAJ-szám', 105),
             'szul_nev': ('Szül. név', 140),
             'anya_neve': ('Anyja neve', 140),
@@ -2085,6 +2246,563 @@ class App:
             self.persons_state['trees'][label] = tree
             self._fill_persons_tree(tree, data[company_of[label]])
 
+        results_tree = self._make_tree(
+            results, ('adoazonosito', 'taj', 'cegek'),
+            {'#0': ('Név / cég', 220), 'adoazonosito': ('Adóazonosító', 110),
+             'taj': ('TAJ-szám', 105), 'cegek': ('Cégek', 260)},
+            hscroll=True)
+        results_tree.bind('<Double-1>', lambda e: self._open_search_result(e))
+        self.persons_state['results_tree'] = results_tree
+
+        def on_search(*_):
+            query = search_var.get()
+            if not query.strip():
+                results.pack_forget()
+                browse.pack(fill='both', expand=True)
+                search_info.configure(text='név, adóazonosító vagy TAJ — az összes cégben')
+                return
+            browse.pack_forget()
+            results.pack(fill='both', expand=True)
+            people, hits = self._fill_search_results(results_tree, query)
+            search_info.configure(
+                text=f'{people} személy, {hits} céges adatlap' if people else 'Nincs találat.')
+
+        search_var.trace_add('write', on_search)
+        search_var.set(previous_query)
+        search_entry.focus_set()
+        search_entry.icursor('end')
+
+    @staticmethod
+    def _normalize_text(text):
+        """Kisbetűs, ékezet nélküli alak: a 'Kovács' a 'kovacs'-ra is találjon."""
+        decomposed = unicodedata.normalize('NFKD', str(text or '').lower())
+        return ''.join(c for c in decomposed if not unicodedata.combining(c))
+
+    def _search_persons(self, query):
+        """A keresésnek megfelelő személyek, cégek szerint csoportosítva.
+
+        Minden szónak illeszkednie kell a névre, a születési névre, az
+        adóazonosítóra vagy a TAJ-ra (a számok szóközök nélkül). Ugyanaz a
+        személy több cégnél is szerepelhet: az adóazonosító (ennek hiányában a
+        TAJ) alapján egy csoportba kerülnek. Visszatérés: csoportok listája,
+        mindegyik [(fül-felirat, dokumentumazonosító, adatlap), ...].
+        """
+        state = self.persons_state
+        tokens = self._normalize_text(query).split()
+        matches = []
+        for label, company in state['company_of'].items():
+            for doc_id, p in state['data'][company].items():
+                haystack = ' '.join((self._normalize_text(p.get('nev')),
+                                     self._normalize_text(p.get('szul_nev')),
+                                     generate.ado_key(p.get('adoazonosito')),
+                                     generate.taj_key(p.get('taj'))))
+                if all(t in haystack for t in tokens):
+                    matches.append((label, doc_id, p))
+
+        groups = {}
+        by_taj = {}
+        # Előbb az adóazonosítós adatlapok, hogy egy régi (adóazonosító
+        # nélküli) adatlap a TAJ-a alapján hozzájuk csatlakozhasson.
+        matches.sort(key=lambda m: not generate.ado_key(m[2].get('adoazonosito')))
+        for label, doc_id, p in matches:
+            ado = generate.ado_key(p.get('adoazonosito'))
+            taj = generate.taj_key(p.get('taj'))
+            if ado:
+                gkey = 'ado:' + ado
+                if taj:
+                    by_taj.setdefault(taj, gkey)
+            elif taj:
+                gkey = by_taj.get(taj, 'taj:' + taj)
+            else:
+                gkey = f'doc:{label}:{doc_id}'
+            groups.setdefault(gkey, []).append((label, doc_id, p))
+        return sorted(groups.values(),
+                      key=lambda g: self._normalize_text(g[0][2].get('nev')))
+
+    def _fill_search_results(self, tree, query):
+        tree.delete(*tree.get_children())
+        items = self.persons_state['results_items'] = {}
+        people = self.persons_state['results_people'] = {}
+        groups = self._search_persons(query)
+        if not groups:
+            tree.insert('', 'end', iid='__empty__', text='(Nincs találat.)')
+            self._autosize_columns(tree)
+            return 0, 0
+        hits = 0
+        for i, group in enumerate(groups):
+            first = group[0][2]
+            ado = next((p.get('adoazonosito') for _, _, p in group if p.get('adoazonosito')), '')
+            labels = sorted({label for label, _, _ in group})
+            parent = tree.insert('', 'end', text=first.get('nev', ''), open=True,
+                                 values=(ado, first.get('taj', ''), ', '.join(labels)),
+                                 tags=('odd' if i % 2 else 'even',))
+            taj = next((p.get('taj') for _, _, p in group if p.get('taj')), '')
+            people[parent] = (ado, taj, first.get('nev', ''))
+            # egy céges találatnál a szülősor is egyértelműen azt az adatlapot jelenti
+            if len(group) == 1:
+                items[parent] = group[0][:2]
+            for label, doc_id, p in sorted(group, key=lambda g: g[0].lower()):
+                # ha egy cégnél másképp írták a nevet, az is látsszon
+                other_name = p.get('nev', '') != first.get('nev', '')
+                text = f'🏢  {label}' + (f"  ({p.get('nev', '')})" if other_name else '')
+                child = tree.insert(parent, 'end', text=text,
+                                    values=(p.get('adoazonosito', ''), p.get('taj', ''), ''),
+                                    tags=('odd' if i % 2 else 'even',))
+                items[child] = (label, doc_id)
+                people[child] = (p.get('adoazonosito', ''), p.get('taj', ''), p.get('nev', ''))
+                hits += 1
+        self._autosize_columns(tree)
+        return len(groups), hits
+
+    def _open_search_result(self, event=None):
+        """Dupla katt egy találaton: a személy során a munkanapló nyílik meg,
+        a cég-soron a cég fülére ugrik, a személyt kijelölve."""
+        state = self.persons_state
+        tree = state['results_tree']
+        sel = tree.selection()
+        if sel and tree.get_children(sel[0]):
+            self._show_selected_worklog()
+            return 'break'  # a dupla katt ne csukja össze a sort
+        picked = state['results_items'].get(sel[0]) if sel else None
+        if not picked:
+            return
+        label, doc_id = picked
+        state['search_var'].set('')
+        state['select'](label)
+        tree = state['trees'][label]
+        if tree.exists(doc_id):
+            tree.selection_set(doc_id)
+            tree.focus(doc_id)
+            tree.see(doc_id)
+
+    # --- Munkanapló (személyenkénti összesítés) ---
+
+    def _selected_identity(self):
+        """(adóazonosító, TAJ, név) a kijelölt személyhez — a keresőben a
+        személy sorára (több cég esetén is) vagy a cég-sorra, a fül-nézetben a
+        kijelölt sorra. None, ha nincs kijelölés."""
+        state = self.persons_state
+        if not state.get('trees'):
+            return None
+        if state['search_var'].get().strip():
+            sel = state['results_tree'].selection()
+            return state['results_people'].get(sel[0]) if sel else None
+        label = state['switcher_state']['active']
+        sel = [i for i in state['trees'][label].selection() if i != '__empty__']
+        person = state['data'][state['company_of'][label]].get(sel[0]) if sel else None
+        if not person:
+            return None
+        return person.get('adoazonosito', ''), person.get('taj', ''), person.get('nev', '')
+
+    def _show_selected_worklog(self):
+        identity = self._selected_identity()
+        if not identity:
+            messagebox.showinfo('Munkanapló', 'Válassz ki egy személyt a listából.')
+            return
+        self._with_worklog(lambda people: self._open_worklog_window(identity, people))
+
+    def _with_worklog(self, then):
+        """A munkanapló betöltése (egyszer, utána a gyorsítótárból)."""
+        if self.worklog_cache is not None:
+            then(self.worklog_cache)
+            return
+
+        def done(people, error):
+            if error:
+                messagebox.showerror('Hiba', f'A munkanapló betöltése nem sikerült:\n{error}')
+                return
+            self.worklog_cache = people
+            then(people)
+
+        self.run_async(self._load_worklog_work, done, 'Munkanapló betöltése...')
+
+    def _load_worklog_work(self):
+        online, err = self._try_sign_in()
+        if not online:
+            raise FirebaseError(f'A Firestore nem érhető el. {err or ""}'.strip())
+        companies = self.known_companies()
+        histories = self._parallel_map(companies, self.store.load_history)
+        imports = self._parallel_map(companies, self.store.load_worklog_imports)
+
+        latest = {c: worklog.latest_processing(histories[c]) for c in companies}
+        wanted = [(c, ym, row.get('snapshot_id'))
+                  for c in companies for ym, row in latest[c].items()]
+
+        def load(item):
+            if not item[2]:
+                return None
+            try:
+                loaded = self.store.load_snapshot(item[0], item[2])
+            except Exception:
+                return None  # egy olvashatatlan hónap ne vigye el az egész naplót
+            return loaded['payload'] if loaded else None
+
+        payloads = self._parallel_map(wanted, load)
+        data = {c: {'snapshots': {}, 'imports': imports[c]} for c in companies}
+        # azok a hónapok, amelyek legutóbbi feldolgozásának tartalma nem érhető
+        # el (és az archívumból sincs pótolva) — ezek napjai hiányozhatnak
+        missing = {}
+        for (c, ym, sid), payload in payloads.items():
+            if payload:
+                data[c]['snapshots'][ym] = payload
+            elif ym not in imports[c]:
+                missing.setdefault(c, []).append(ym)
+        self.worklog_missing = {c: sorted(m) for c, m in missing.items()}
+        return worklog.build(data)
+
+    def _open_worklog_window(self, identity, people):
+        ado, taj, nev = identity
+        records = worklog.find(people, ado, taj, nev)
+        record = worklog.merge(records)
+        summary = worklog.summarize(record)
+
+        dlg = tk.Toplevel(self.root)
+        dlg.transient(self.root)
+        dlg.title(f'Munkanapló — {record["nev"] or nev}')
+        dlg.configure(bg=COLORS['card'])
+        dlg.geometry('720x520')
+        dlg.minsize(560, 380)
+
+        head = ttk.Frame(dlg, style='Card.TFrame')
+        head.pack(fill='x', padx=20, pady=(16, 6))
+        ttk.Label(head, text=f'📅  {record["nev"] or nev}', background=COLORS['card'],
+                  font=FONT_BOLD).pack(anchor='w')
+        ttk.Label(head, text=f'Adóazonosító: {record["adoazonosito"] or ado or "—"}   •   '
+                             f'TAJ: {record["taj"] or taj or "—"}',
+                  background=COLORS['card'], foreground=COLORS['muted'],
+                  font=FONT_BASE).pack(anchor='w')
+
+        if summary['companies']:
+            n_comp = len(summary['companies'])
+            text = (f"Összesen {summary['total_days']} munkanap"
+                    + (f' {n_comp} cégnél' if n_comp > 1 else '')
+                    + f" — első: {summary['first']:%Y.%m.%d.}, utolsó: {summary['last']:%Y.%m.%d.}")
+            if summary['total_unique_days'] != summary['total_days']:
+                text += (f"\n(ebből {summary['total_days'] - summary['total_unique_days']} napon "
+                         'egyszerre több cégnél is szerepel)')
+        else:
+            text = 'Ehhez a személyhez nincs rögzített munkanap a mentett havi statisztikákban.'
+        ttk.Label(head, text=text, background=COLORS['card'], font=FONT_BASE,
+                  justify='left').pack(anchor='w', pady=(6, 0))
+
+        notes = []
+        if record['withdrawn']:
+            listed = ', '.join(f'{c}: {d:%Y.%m.%d.}' for c, d, _ in sorted(record['withdrawn'])[:6])
+            more = len(record['withdrawn']) - 6
+            notes.append(f'Visszavont bejelentés (nem számít bele): {listed}'
+                         + (f' és még {more}' if more > 0 else ''))
+        if any(c['archive_months'] for c in summary['companies']):
+            notes.append('A (archív) jelű hónapok a helyi archívumból lettek betöltve.')
+        gaps = ['{}: {}'.format(c['company'], ', '.join(self.worklog_missing[c['company']]))
+                for c in summary['companies'] if self.worklog_missing.get(c['company'])]
+        if gaps:
+            notes.append('Hiányos lehet — ezeknek a hónapoknak a legutóbbi feldolgozása nem '
+                         'érhető el (régebbi verzió vagy sikertelen mentés; a 📥 archívum-'
+                         'betöltés pótolhatja): ' + '; '.join(gaps))
+        notes.append('Forrás: a havi statisztikák legutóbbi feldolgozása (újrafeltöltéskor '
+                     'a javított verzió számít).')
+        ttk.Label(head, text='\n'.join(notes), background=COLORS['card'],
+                  foreground=COLORS['muted'], font=FONT_BASE, wraplength=660,
+                  justify='left').pack(anchor='w', pady=(6, 0))
+
+        # a gombsor előbb kerül fel, hogy kis ablakban se lógjon le
+        btns = ttk.Frame(dlg, style='Card.TFrame')
+        btns.pack(side='bottom', pady=(8, 16))
+        ttk.Button(btns, text='📄  Mentés Excelbe', style='Secondary.TButton',
+                   command=lambda: self._export_worklog(record, summary, dlg)).pack(side='left', padx=6)
+        ttk.Button(btns, text='Bezárás', style='Accent.TButton',
+                   command=dlg.destroy).pack(side='left', padx=6)
+
+        body = ttk.Frame(dlg, style='Card.TFrame')
+        body.pack(fill='both', expand=True, padx=8)
+        tree = self._make_tree(body, ('napok', 'elso', 'utolso', 'datumok'),
+                               {'#0': ('Cég / hónap', 200), 'napok': ('Napok', 60),
+                                'elso': ('Első nap', 95), 'utolso': ('Utolsó nap', 95),
+                                'datumok': ('Napok listája', 300)},
+                               hscroll=True)
+        for i, c in enumerate(summary['companies']):
+            parent = tree.insert('', 'end', text=f"🏢  {c['company']}", open=True,
+                                 values=(c['count'], f"{c['first']:%Y.%m.%d.}",
+                                         f"{c['last']:%Y.%m.%d.}", ''),
+                                 tags=('odd' if i % 2 else 'even',))
+            for ym, days in c['months']:
+                archive = ' (archív)' if ym in c['archive_months'] else ''
+                tree.insert(parent, 'end', text=f'{ym}{archive}',
+                            values=(len(days), f'{days[0]:%Y.%m.%d.}', f'{days[-1]:%Y.%m.%d.}',
+                                    ', '.join(f'{d:%m.%d.}' for d in days)),
+                            tags=('odd' if i % 2 else 'even',))
+        self._autosize_columns(tree)
+
+        dlg.bind('<Escape>', lambda e: dlg.destroy())
+
+    def _export_worklog(self, record, summary, parent):
+        name = record['nev'] or 'szemely'
+        dest = filedialog.asksaveasfilename(
+            parent=parent, title='Munkanapló mentése', defaultextension='.xlsx',
+            initialfile=f'{filename_utils.safe_folder_name(name)}_munkanaplo.xlsx',
+            filetypes=[('Excel fájlok', '*.xlsx')])
+        if not dest:
+            return
+        try:
+            worklog.export_xlsx(record, summary, dest)
+        except Exception as e:
+            messagebox.showerror('Hiba', f'A mentés nem sikerült:\n{e}', parent=parent)
+            return
+        self.log_link('Munkanapló mentve: ', dest)
+        messagebox.showinfo('Kész', f'A munkanapló elmentve:\n{dest}', parent=parent)
+
+    # --- Adatok ellenőrzése és egységesítése (a már rögzített személyekre) ---
+
+    FIELD_LABELS = {'nev': 'Név', 'szul_nev': 'Szül. név', 'anya_neve': 'Anyja neve',
+                    'szul_hely_ido': 'Szül.hely, idő', 'lakcim': 'Lakcím',
+                    'adoazonosito': 'Adóazonosító', 'taj': 'TAJ-szám'}
+
+    def open_data_check(self):
+        state = self.persons_state
+        if not state.get('data'):
+            messagebox.showinfo('Adatok ellenőrzése', 'Nincsenek betöltött személyek.')
+            return
+        changes, issues = self._collect_data_check(state['company_of'], state['data'])
+        self._open_data_check_window(changes, issues)
+
+    @staticmethod
+    def _collect_data_check(company_of, data):
+        """(javaslatok, problémák) az összes rögzített adatlapra.
+
+        javaslat: (fül, cég, dok.azonosító, személy, mező, régi, új)
+        probléma: (fül, cég, dok.azonosító, személy, szöveg)
+        """
+        changes, issues = [], []
+        by_ado, by_taj = {}, {}
+        for label, company in company_of.items():
+            for doc_id, p in sorted(data[company].items(), key=lambda x: x[1].get('nev', '').lower()):
+                for field, old, new in normalize.person_changes(p):
+                    changes.append((label, company, doc_id, p, field, old, new))
+                for text in normalize.check_person(p):
+                    issues.append((label, company, doc_id, p, text))
+                ado, taj = generate.ado_key(p.get('adoazonosito')), generate.taj_key(p.get('taj'))
+                if ado:
+                    by_ado.setdefault(ado, []).append((label, company, doc_id, p))
+                if taj:
+                    by_taj.setdefault(taj, []).append((label, company, doc_id, p))
+
+        # cégeken átívelő ellentmondások
+        def norm_name(p):
+            return App._normalize_text(normalize.normalize_name(p.get('nev', '')))
+
+        for ado, group in by_ado.items():
+            names = {norm_name(p) for _, _, _, p in group}
+            if len(names) > 1:
+                listed = ', '.join(sorted({f'{p.get("nev")} ({label})' for label, _, _, p in group}))
+                for label, company, doc_id, p in group:
+                    issues.append((label, company, doc_id, p,
+                                   f'Ugyanez az adóazonosító más névvel is szerepel: {listed}'))
+        for taj, group in by_taj.items():
+            ados = {generate.ado_key(p.get('adoazonosito')) for _, _, _, p in group} - {''}
+            if len(ados) > 1:
+                listed = ', '.join(sorted({f'{p.get("nev")} – {p.get("adoazonosito")} ({label})'
+                                           for label, _, _, p in group}))
+                for label, company, doc_id, p in group:
+                    issues.append((label, company, doc_id, p,
+                                   f'Ugyanez a TAJ-szám más adóazonosítóval is szerepel '
+                                   f'(valamelyik elírás lehet): {listed}'))
+        return changes, issues
+
+    def _open_data_check_window(self, changes, issues):
+        dlg = tk.Toplevel(self.root)
+        dlg.transient(self.root)
+        dlg.title('Adatok ellenőrzése')
+        dlg.configure(bg=COLORS['card'])
+        dlg.geometry('900x560')
+        dlg.minsize(640, 400)
+
+        ttk.Label(dlg, text='🧹  Adatok ellenőrzése és egységesítése', background=COLORS['card'],
+                  font=FONT_BOLD).pack(anchor='w', padx=20, pady=(16, 2))
+        ttk.Label(dlg, text='Csak a már rögzített adatlapokat vizsgálja; a feldolgozott '
+                            'Excel-fájlokhoz és a statisztikákhoz nem nyúl. Semmi nem változik, '
+                            'amíg az „Alkalmazás” gombot meg nem nyomod.',
+                  background=COLORS['card'], foreground=COLORS['muted'], font=FONT_BASE,
+                  wraplength=840, justify='left').pack(anchor='w', padx=20, pady=(0, 8))
+
+        nb = ttk.Notebook(dlg)
+        nb.pack(fill='both', expand=True, padx=12)
+
+        # --- 1. fül: egységesítési javaslatok ---
+        tab1 = ttk.Frame(nb, style='Card.TFrame')
+        nb.add(tab1, text=f'  Egységesítés ({len(changes)})  ')
+        ttk.Label(tab1, text='A kijelölt sorok kerülnek alkalmazásra (alapból mind). '
+                             'Ctrl+katt: egy sor ki/be, Shift+katt: tartomány.',
+                  background=COLORS['card'], foreground=COLORS['muted'],
+                  font=FONT_BASE).pack(anchor='w', padx=12, pady=(10, 0))
+        ctree = self._make_tree(tab1, ('ceg', 'mezo', 'regi', 'uj'),
+                                {'#0': ('Név', 160), 'ceg': ('Cég', 120), 'mezo': ('Mező', 100),
+                                 'regi': ('Jelenleg', 220), 'uj': ('Javasolt', 220)},
+                                hscroll=True)
+        change_of = {}
+        for i, ch in enumerate(changes):
+            label, company, doc_id, p, field, old, new = ch
+            iid = ctree.insert('', 'end', text=p.get('nev', ''),
+                               values=(label, self.FIELD_LABELS.get(field, field), old, new),
+                               tags=('odd' if i % 2 else 'even',))
+            change_of[iid] = ch
+        if changes:
+            ctree.selection_set(list(change_of))
+        else:
+            ctree.insert('', 'end', text='(Minden adat egységes — nincs javaslat.)')
+        self._autosize_columns(ctree)
+
+        # --- 2. fül: problémák ---
+        tab2 = ttk.Frame(nb, style='Card.TFrame')
+        nb.add(tab2, text=f'  Problémák ({len(issues)})  ')
+        ttk.Label(tab2, text='Ezeket nem lehet automatikusan javítani. Dupla kattintás: '
+                             'a személy szerkesztése.',
+                  background=COLORS['card'], foreground=COLORS['muted'],
+                  font=FONT_BASE).pack(anchor='w', padx=12, pady=(10, 0))
+        itree = self._make_tree(tab2, ('ceg', 'problema'),
+                                {'#0': ('Név', 160), 'ceg': ('Cég', 120), 'problema': ('Probléma', 520)},
+                                hscroll=True)
+        issue_of = {}
+        for i, (label, company, doc_id, p, text) in enumerate(issues):
+            iid = itree.insert('', 'end', text=p.get('nev', ''), values=(label, text),
+                               tags=('odd' if i % 2 else 'even',))
+            issue_of[iid] = (company, doc_id, p)
+        if not issues:
+            itree.insert('', 'end', text='(Nem találtunk problémát.)')
+        self._autosize_columns(itree)
+
+        def edit_issue(_e=None):
+            sel = itree.selection()
+            if sel and sel[0] in issue_of:
+                dlg.destroy()
+                self._open_person_edit_dialog(*issue_of[sel[0]])
+
+        itree.bind('<Double-1>', edit_issue)
+
+        def apply():
+            picked = [change_of[i] for i in ctree.selection() if i in change_of]
+            if not picked:
+                messagebox.showinfo('Egységesítés', 'Nincs kijelölt javaslat.', parent=dlg)
+                return
+            per_person = {}
+            for label, company, doc_id, p, field, old, new in picked:
+                key = (company, doc_id)
+                per_person.setdefault(key, dict(p))[field] = new
+            if not messagebox.askyesno(
+                    'Egységesítés',
+                    f'{len(picked)} mező módosul {len(per_person)} adatlapon. Folytatod?',
+                    parent=dlg):
+                return
+
+            def work():
+                failed = []
+                for (company, doc_id), updated in per_person.items():
+                    try:
+                        self.store.save_person(company, updated, old_doc_id=doc_id)
+                    except Exception as e:
+                        failed.append(f'{updated.get("nev")}: {e}')
+                return failed
+
+            def done(failed, error):
+                if error or failed:
+                    messagebox.showerror('Hiba', 'Néhány adatlap mentése nem sikerült:\n'
+                                         + (str(error) if error else '\n'.join(failed[:10])))
+                else:
+                    self.log(f'Egységesítés: {len(picked)} mező javítva {len(per_person)} adatlapon.')
+                dlg.destroy()
+                self.show_persons()
+
+            self.run_async(work, done, 'Egységesítés mentése...')
+
+        btns = ttk.Frame(dlg, style='Card.TFrame')
+        btns.pack(pady=(8, 16))
+        ttk.Button(btns, text='Bezárás', style='Secondary.TButton',
+                   command=dlg.destroy).pack(side='left', padx=6)
+        if changes:
+            ttk.Button(btns, text='✓  Kijelöltek alkalmazása', style='Accent.TButton',
+                       command=apply).pack(side='left', padx=6)
+        dlg.bind('<Escape>', lambda e: dlg.destroy())
+        if not changes and issues:
+            nb.select(tab2)
+
+    # --- Régi hónapok betöltése a helyi archívumból (munkanaplóhoz) ---
+
+    def import_archive(self):
+        if not self.store:
+            messagebox.showinfo('Archívum', 'Nincs beállítva Firebase-kapcsolat.')
+            return
+        roots = archive_import.candidate_archive_roots(getattr(config, 'ARCHIVE_DIR', None) if config else None)
+        if not roots:
+            folder = filedialog.askdirectory(title='Az archívum mappája')
+            if not folder:
+                return
+            roots = [folder]
+
+        def work():
+            known = self.known_companies()
+            warnings = []
+            items = []
+            for root_dir in roots:
+                items += archive_import.scan_archive(root_dir, warnings=warnings)
+            result = archive_import.build_import(
+                items, lambda folder: archive_import.match_company_folder(folder, known))
+            result['warnings'] = warnings + result['warnings']
+            result['roots'] = roots
+            return result
+
+        self.run_async(work, self._confirm_archive_import, 'Archívum átvizsgálása...')
+
+    def _confirm_archive_import(self, result, error):
+        if error:
+            messagebox.showerror('Hiba', f'Az archívum átvizsgálása nem sikerült:\n{error}')
+            return
+        imports = result['imports']
+        for w in result['warnings']:
+            self.log(f'Archívum: {w}')
+        for item in result['unresolved']:
+            self.log(f"Archívum — kihagyva: {item['path']} ({item.get('reason', '')})")
+        if not imports:
+            messagebox.showinfo('Archívum', 'Az archívumban nem találtunk betölthető hónapot.\n\n'
+                                            'Átvizsgált mappák:\n' + '\n'.join(result['roots']))
+            return
+        companies = sorted({c for c, _ in imports})
+        superseded = sum(len(v['superseded']) for v in imports.values())
+        text = (f"{len(imports)} hónap betölthető {len(companies)} cégtől "
+                f"({', '.join(companies[:5])}{' …' if len(companies) > 5 else ''}).\n\n")
+        if superseded:
+            text += (f'{superseded} régebbi fájl kimarad, mert ugyanarra a hónapra van újabb '
+                     '(újrafeltöltött) változat.\n')
+        if result['unresolved']:
+            text += f"{len(result['unresolved'])} fájl nem azonosítható (lásd a naplót).\n"
+        text += ('\nA betöltött adat csak a munkanaplóhoz kell: a várakozási sorhoz, az '
+                 'előzményekhez és a személyekhez nem nyúl. Ahol egy hónapnak már van '
+                 'felhőben mentett tartalma, ott az számít. Újbóli betöltés felülírja '
+                 'ugyanazt a hónapot.\n\nBetöltöd?')
+        if not messagebox.askyesno('Régi hónapok betöltése', text):
+            return
+
+        def work():
+            failed = []
+            for (company, ym), item in sorted(imports.items()):
+                try:
+                    self.store.save_worklog_import(company, ym, {
+                        'source': os.path.basename(item['source']),
+                        'persons': item['persons'],
+                    })
+                except Exception as e:
+                    failed.append(f'{company} {ym}: {e}')
+            return failed
+
+        def done(failed, error):
+            self.worklog_cache = None
+            if error or failed:
+                messagebox.showerror('Hiba', 'Néhány hónap betöltése nem sikerült:\n'
+                                     + (str(error) if error else '\n'.join(failed[:10])))
+                return
+            self.log(f'Archívum: {len(imports)} hónap betöltve a munkanaplóba.')
+            messagebox.showinfo('Kész', f'{len(imports)} hónap betöltve a munkanaplóba.')
+
+        self.run_async(work, done, 'Betöltés...')
+
     def _fill_persons_tree(self, tree, persons):
         tree.delete(*tree.get_children())
         if not persons:
@@ -2094,10 +2812,10 @@ class App:
             return
         for i, (key, p) in enumerate(sorted(persons.items(),
                                             key=lambda x: x[1].get('nev', '').lower())):
-            # üres TAJ-ú (régi) rekordnál a kulcs üres lenne, ami nem lehet iid
-            tree.insert('', 'end', iid=key or f'__nokey_{i}', text=p.get('nev', ''),
-                        values=(p.get('taj', ''), p.get('szul_nev', ''), p.get('anya_neve', ''),
-                                p.get('szul_hely_ido', ''), p.get('lakcim', '')),
+            tree.insert('', 'end', iid=key, text=p.get('nev', ''),
+                        values=(p.get('adoazonosito', ''), p.get('taj', ''), p.get('szul_nev', ''),
+                                p.get('anya_neve', ''), p.get('szul_hely_ido', ''),
+                                p.get('lakcim', '')),
                         tags=('odd' if i % 2 else 'even',))
         self._autosize_columns(tree)
 
@@ -2113,38 +2831,50 @@ class App:
         head_font = tkfont.Font(font=FONT_BOLD)
         columns = ('#0',) + tuple(tree['columns'])
         widths = {c: head_font.measure(tree.heading(c, 'text')) for c in columns}
-        for iid in tree.get_children():
+        stack = list(tree.get_children())
+        while stack:
+            iid = stack.pop()
+            stack.extend(tree.get_children(iid))
             item = tree.item(iid)
             texts = [item['text']] + [str(v) for v in item['values']]
             for col, text in zip(columns, texts):
                 widths[col] = max(widths[col], font.measure(text))
         for col, w in widths.items():
             # a '#0' oszlopban a fa-behúzás is helyet foglal
-            extra = 20 if col == '#0' else 0
+            extra = 40 if col == '#0' else 0
             tree.column(col, width=min(w + padding + extra, max_width))
 
     def _selected_person(self, action):
-        """(cég, kulcs, személy) a kijelölt sorhoz, vagy None."""
+        """(cég, dokumentumazonosító, személy) a kijelölt sorhoz, vagy None."""
         state = self.persons_state
         if not state.get('trees'):
             return None
-        label = state['switcher_state']['active']
-        tree = state['trees'][label]
-        sel = [i for i in tree.selection() if i != '__empty__']
-        if not sel:
-            messagebox.showinfo(action, 'Válassz ki egy személyt a listából.')
-            return None
+        if state['search_var'].get().strip():
+            sel = state['results_tree'].selection()
+            picked = state['results_items'].get(sel[0]) if sel else None
+            if not picked:
+                messagebox.showinfo(action, 'Válassz ki egy találatot — ha a személy több '
+                                            'cégnél is szerepel, a cég sorát a neve alatt.')
+                return None
+            label, key = picked
+        else:
+            label = state['switcher_state']['active']
+            tree = state['trees'][label]
+            sel = [i for i in tree.selection() if i != '__empty__']
+            if not sel:
+                messagebox.showinfo(action, 'Válassz ki egy személyt a listából.')
+                return None
+            key = sel[0]
         company = state['company_of'][label]
-        person = state['data'][company].get(sel[0])
+        person = state['data'][company].get(key)
         if not person:
             return None
-        return company, sel[0], person
+        return company, key, person
 
     def _edit_selected_person(self):
         picked = self._selected_person('Szerkesztés')
         if picked:
-            company, _, person = picked
-            self._open_person_edit_dialog(company, person)
+            self._open_person_edit_dialog(*picked)
 
     def _delete_selected_person(self):
         picked = self._selected_person('Törlés')
@@ -2157,7 +2887,7 @@ class App:
             return
 
         def work():
-            self.store.delete_person(company, person.get('taj') or key)
+            self.store.delete_person(company, key)
 
         def done(_, error):
             if error:
@@ -2167,7 +2897,7 @@ class App:
 
         self.run_async(work, done, 'Törlés...')
 
-    def _open_person_edit_dialog(self, company, person):
+    def _open_person_edit_dialog(self, company, doc_id, person):
         dlg = tk.Toplevel(self.root)
         dlg.transient(self.root)  # mindig a főablak fölött marad
         dlg.title('Személy szerkesztése')
@@ -2178,14 +2908,18 @@ class App:
         ttk.Label(dlg, text='✏️', font=('Segoe UI', 22), background=COLORS['card']).pack(pady=(18, 4))
         ttk.Label(dlg, text=person.get('nev', ''), background=COLORS['card'],
                   font=FONT_BOLD).pack()
-        ttk.Label(dlg, text=f"TAJ: {person.get('taj', '')}", background=COLORS['card'],
+        ttk.Label(dlg, text=company or LEGACY_PERSONS_TAB, background=COLORS['card'],
                   foreground=COLORS['muted'], font=FONT_BASE).pack(pady=(0, 10))
 
         form = ttk.Frame(dlg, style='Card.TFrame')
         form.pack(padx=24, fill='x')
         form.grid_columnconfigure(1, weight=1)
 
+        # Az azonosítók is javíthatók (pl. elírt TAJ); az adóazonosító
+        # módosításakor az adatlap új azonosítóra költözik (lásd save_person).
         fields = [
+            ('adoazonosito', 'Adóazonosító:'),
+            ('taj', 'TAJ-szám:'),
             ('szul_nev', 'Születési név:'),
             ('anya_neve', 'Anyja neve:'),
             ('szul_hely_ido', 'Szül.hely, idő:'),
@@ -2207,9 +2941,31 @@ class App:
             updated = dict(person)
             for key, var in vars_.items():
                 updated[key] = var.get().strip()
+            if not generate.ado_key(updated['adoazonosito']) and not generate.taj_key(updated['taj']):
+                messagebox.showwarning('Hiányzó azonosító',
+                                       'Az adóazonosító és a TAJ-szám közül legalább '
+                                       'az egyiket meg kell adni.', parent=dlg)
+                return
+            bad = []
+            if updated['adoazonosito'] and not normalize.valid_adoazonosito(updated['adoazonosito']):
+                bad.append(f"Az adóazonosító ({updated['adoazonosito']})")
+            if updated['taj'] and not normalize.valid_taj(updated['taj']):
+                bad.append(f"A TAJ-szám ({updated['taj']})")
+            if bad and not messagebox.askyesno(
+                    'Hibás ellenőrzőszám',
+                    '\n'.join(f'{b} ellenőrzőszáma nem stimmel.' for b in bad)
+                    + '\n\nValószínűleg elírás. Mégis elmented így?', parent=dlg):
+                return
+            new_id = FirebaseStore.person_doc_id(updated)
+            others = {k: p for k, p in self.persons_state['data'][company].items() if k != doc_id}
+            if new_id in others:
+                messagebox.showwarning('Már létező személy',
+                                       f'Ezzel az azonosítóval már van adatlap ebben a listában '
+                                       f'({others[new_id].get("nev", "")}).', parent=dlg)
+                return
 
             def work():
-                self.store.save_person(company, updated)
+                self.store.save_person(company, updated, old_doc_id=doc_id)
                 return updated
 
             def done(result, error):
@@ -2229,7 +2985,7 @@ class App:
         dlg.bind('<Return>', lambda e: do_save())
         dlg.bind('<Escape>', lambda e: dlg.destroy())
 
-    def _ask_person_dialog(self, nev, taj, position=None):
+    def _ask_person_dialog(self, nev, adoazonosito, taj, position=None):
         """Adatlap bekérése. Visszatérés: dict, None (kihagyva) vagy SKIP_ALL."""
         result = {'data': None}
         dlg = tk.Toplevel(self.root)
@@ -2244,7 +3000,8 @@ class App:
         if position and position[1] > 1:
             heading += f'  ({position[0]} / {position[1]})'
         ttk.Label(dlg, text=heading, background=COLORS['card'], font=FONT_BOLD).pack()
-        ttk.Label(dlg, text=f'{nev}  •  TAJ: {taj}', background=COLORS['card'],
+        ttk.Label(dlg, text=f'{nev}  •  Adóazonosító: {adoazonosito or "—"}  •  TAJ: {taj or "—"}',
+                  background=COLORS['card'],
                   foreground=COLORS['muted'], font=FONT_BASE).pack(pady=(2, 4))
         ttk.Label(dlg, text='Add meg az adatait, vagy hagyd üresen és nyomj OK-t.\n'
                             'A személy üresen hagyva is bekerül a statisztikába, '
@@ -2275,7 +3032,7 @@ class App:
             # statisztikába, csak az adatlapja marad kitöltetlen. Az üres
             # profilt is elmentjük, így legközelebb nem kérdez rá újra.
             values = {k: v.get().strip() for k, v in vars_.items()}
-            result['data'] = {'taj': taj, 'nev': nev, **values}
+            result['data'] = {'adoazonosito': adoazonosito, 'taj': taj, 'nev': nev, **values}
             dlg.destroy()
 
         def do_skip_all():

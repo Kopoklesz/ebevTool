@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 import requests
 from cryptography.fernet import Fernet
 
-from generate import entry_key, iso_to_serial, serial_to_iso, taj_key
+from generate import ado_key, entry_key, iso_to_serial, serial_to_iso, taj_key
 
 IDENTITY_URL = 'https://identitytoolkit.googleapis.com/v1/accounts:signUp'
 FIRESTORE_BASE = 'https://firestore.googleapis.com/v1'
@@ -270,7 +270,8 @@ class FirebaseStore:
         return records
 
     def sync_processing(self, company, upsert_entries, consume_ids, ym, filename,
-                        history_extra=None, history_id=None, stale_ids=()):
+                        history_extra=None, history_id=None, stale_ids=(),
+                        withdraw_ids=(), restore_ids=()):
         """A várakozási sor frissítése és egy előzmény-rekord létrehozása.
 
         A 'consume_ids' elemei lehetnek sima azonosítók, vagy (id, verzió)
@@ -317,6 +318,22 @@ class FirebaseStore:
                 mask=['status', 'consumed_in', 'updated_at'],
                 if_unchanged_since=version))
 
+        # Visszavont (áthozott) rekordok: megjelölve, nem törölve — a hónap
+        # újrafeldolgozásakor újra elbírálhatók. A visszaállítottak (a javított
+        # fájl már nem vonja vissza) újra függőbe kerülnek.
+        for doc_id, version in withdraw_ids:
+            writes.append(self._update_write(
+                f'companies/{company}/memory/{doc_id}',
+                {'status': 'withdrawn', 'consumed_in': ym, 'updated_at': _now_iso()},
+                mask=['status', 'consumed_in', 'updated_at'],
+                if_unchanged_since=version))
+        for doc_id, version in restore_ids:
+            writes.append(self._update_write(
+                f'companies/{company}/memory/{doc_id}',
+                {'status': 'pending', 'consumed_in': None, 'updated_at': _now_iso()},
+                mask=['status', 'consumed_in', 'updated_at'],
+                if_unchanged_since=version))
+
         history_id = history_id or uuid.uuid4().hex[:24]
         history_fields = {'filename': filename, 'year_month': ym, 'processed_at': _now_iso()}
         history_fields.update(history_extra or {})
@@ -347,7 +364,7 @@ class FirebaseStore:
     def cleanup_expired(self, company):
         today = ym_today()
         expired = [doc['_id'] for doc in self._list(f'companies/{company}/memory')
-                  if doc.get('status') == 'consumed' and doc.get('consumed_in')
+                  if doc.get('status') in ('consumed', 'withdrawn') and doc.get('consumed_in')
                   and months_between(doc['consumed_in'], today) > RETENTION_MONTHS]
         self._commit([self._delete_write(f'companies/{company}/memory/{doc_id}') for doc_id in expired])
         return len(expired)
@@ -413,6 +430,34 @@ class FirebaseStore:
         for doc in self._list(f'companies/{company}/snapshots'):
             self.delete_snapshot(company, doc['_id'])
 
+    # --- archívumból betöltött hónapok (munkanaplóhoz) ---
+    #
+    # A 2026.10.01 előtti feldolgozásoknak nincs snapshotja; a helyi
+    # archívum kimeneteiből kinyert napokat hónaponként egy dokumentumban
+    # tároljuk (titkosítva). Újbóli betöltés felülírja ugyanazt a hónapot.
+
+    def save_worklog_import(self, company, ym, payload):
+        raw = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+        token = self.fernet.encrypt(raw).decode('ascii')
+        if len(token) > CHUNK_SIZE:
+            raise FirebaseError(f'A(z) {company} {ym} archív adata túl nagy a mentéshez.')
+        self._commit([self._update_write(f'companies/{company}/worklog_imports/{ym}', {
+            'payload': token, 'year_month': ym, 'imported_at': _now_iso(),
+        })])
+
+    def load_worklog_imports(self, company):
+        imports = {}
+        for doc in self._list(f'companies/{company}/worklog_imports'):
+            try:
+                imports[doc['_id']] = json.loads(self.fernet.decrypt(doc['payload'].encode('ascii')))
+            except Exception:
+                continue
+        return imports
+
+    def delete_all_worklog_imports(self, company):
+        path = f'companies/{company}/worklog_imports'
+        self._commit([self._delete_write(f'{path}/{d["_id"]}') for d in self._list(path)])
+
     # --- cég-aliasok ---
 
     def get_alias(self, token):
@@ -427,34 +472,32 @@ class FirebaseStore:
         return sorted({doc['company'] for doc in self._list('company_aliases')
                        if doc.get('company')})
 
-    # --- személyek (TAJ-hoz kötött profil, titkosítva) ---
+    # --- személyek (adóazonosítóhoz kötött profil, titkosítva) ---
+
+    PERSON_FIELDS = ('adoazonosito', 'taj', 'nev', 'szul_nev', 'anya_neve',
+                     'szul_hely_ido', 'lakcim')
 
     def _encrypt_person(self, person):
-        payload = {
-            'taj': person.get('taj', ''),
-            'nev': person.get('nev', ''),
-            'szul_nev': person.get('szul_nev', ''),
-            'anya_neve': person.get('anya_neve', ''),
-            'szul_hely_ido': person.get('szul_hely_ido', ''),
-            'lakcim': person.get('lakcim', ''),
-        }
+        payload = {k: person.get(k, '') for k in self.PERSON_FIELDS}
         raw = json.dumps(payload, ensure_ascii=False).encode('utf-8')
         return self.fernet.encrypt(raw).decode('ascii')
 
     def _decrypt_person(self, token):
         payload = json.loads(self.fernet.decrypt(token.encode('ascii')))
-        return {
-            'taj': payload.get('taj', ''),
-            'nev': payload.get('nev', ''),
-            'szul_nev': payload.get('szul_nev', ''),
-            'anya_neve': payload.get('anya_neve', ''),
-            'szul_hely_ido': payload.get('szul_hely_ido', ''),
-            'lakcim': payload.get('lakcim', ''),
-        }
+        # a régi adatlapokon nincs 'adoazonosito' — ott üres marad
+        return {k: payload.get(k, '') for k in self.PERSON_FIELDS}
 
     @staticmethod
-    def _taj_doc_id(taj):
-        return hashlib.sha256(taj_key(taj).encode('utf-8')).hexdigest()[:32]
+    def person_doc_id(person):
+        """A személy dokumentumazonosítója.
+
+        Adóazonosítóval az abból képzett hash; enélkül (régi adatlap, vagy
+        hiányzó adóazonosító) a korábbi, TAJ-ból képzett hash — így a régi
+        dokumentumok azonosítója nem változik, amíg nem kapnak adóazonosítót.
+        """
+        ado = ado_key(person.get('adoazonosito'))
+        source = f'ado:{ado}' if ado else taj_key(person.get('taj'))
+        return hashlib.sha256(source.encode('utf-8')).hexdigest()[:32]
 
     @staticmethod
     def _persons_path(company):
@@ -466,25 +509,37 @@ class FirebaseStore:
         return f'companies/{company}/persons' if company else 'persons'
 
     def load_persons(self, company):
-        """A cég személyei, a normalizált TAJ szerint kulcsolva (lásd taj_key)."""
+        """A cég személyei a dokumentumazonosítójuk szerint kulcsolva.
+
+        Kereséshez a generate.find_person való (adóazonosító, tartalékként TAJ).
+        """
         persons = {}
         for doc in self._list(self._persons_path(company)):
             try:
-                person = self._decrypt_person(doc['payload'])
-                persons[taj_key(person['taj'])] = person
+                persons[doc['_id']] = self._decrypt_person(doc['payload'])
             except Exception:
                 continue
         return persons
 
-    def save_person(self, company, person):
-        doc_id = self._taj_doc_id(person['taj'])
-        self._commit([self._update_write(f'{self._persons_path(company)}/{doc_id}', {
+    def save_person(self, company, person, old_doc_id=None):
+        """Mentés; az 'old_doc_id' a személy korábbi dokumentuma.
+
+        Ha az azonosító megváltozott (a régi, TAJ-alapú adatlap adóazonosítót
+        kapott, vagy az adóazonosítót javították), a régi dokumentumot
+        ugyanabban a commitban töröljük, hogy ne maradjon kettőzött adatlap.
+        """
+        path = self._persons_path(company)
+        doc_id = self.person_doc_id(person)
+        writes = [self._update_write(f'{path}/{doc_id}', {
             'payload': self._encrypt_person(person),
             'updated_at': _now_iso(),
-        })])
+        })]
+        if old_doc_id and old_doc_id != doc_id:
+            writes.append(self._delete_write(f'{path}/{old_doc_id}'))
+        self._commit(writes)
+        return doc_id
 
-    def delete_person(self, company, taj):
-        doc_id = self._taj_doc_id(taj)
+    def delete_person(self, company, doc_id):
         self._request('DELETE', f'{self._persons_path(company)}/{doc_id}')
 
     def delete_all_persons(self, company):
