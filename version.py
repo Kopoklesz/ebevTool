@@ -8,7 +8,7 @@ Kiadáskor EZT az egy sort kell átírni, majd ugyanezzel a névvel tag-elni:
     git tag 2026.08.04 && git push origin 2026.08.04
 """
 
-__version__ = '2026.10.02.2'
+__version__ = '2026.10.02.3'
 
 # A GitHub repó, ahonnan a frissítés érkezik (publikus, token nem kell).
 GITHUB_OWNER = 'Kopoklesz'

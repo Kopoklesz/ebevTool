@@ -85,6 +85,7 @@ def _parse_doc(doc):
     # A dokumentum verziója: ezzel tudjuk feltételessé tenni a későbbi írást,
     # hogy egy közben történt módosítást ne írjunk felül észrevétlenül.
     parsed['_update_time'] = doc.get('updateTime')
+    parsed['_create_time'] = doc.get('createTime')
     return parsed
 
 
@@ -449,9 +450,11 @@ class FirebaseStore:
         imports = {}
         for doc in self._list(f'companies/{company}/worklog_imports'):
             try:
-                imports[doc['_id']] = json.loads(self.fernet.decrypt(doc['payload'].encode('ascii')))
+                payload = json.loads(self.fernet.decrypt(doc['payload'].encode('ascii')))
             except Exception:
                 continue
+            payload['_imported_at'] = doc.get('imported_at') or ''
+            imports[doc['_id']] = payload
         return imports
 
     def delete_all_worklog_imports(self, company):
@@ -479,13 +482,21 @@ class FirebaseStore:
 
     def _encrypt_person(self, person):
         payload = {k: person.get(k, '') for k in self.PERSON_FIELDS}
+        # Mely mezők értéke származik az archívumból (nem a programban vitték
+        # fel). Ütközéskor a programban felvitt adat az erősebb, ezért ezt
+        # meg kell jegyezni. Hiányzó kulcs: régi adatlap, a forrás ismeretlen.
+        if 'archive_fields' in person:
+            payload['archive_fields'] = sorted(set(person['archive_fields'] or ()))
         raw = json.dumps(payload, ensure_ascii=False).encode('utf-8')
         return self.fernet.encrypt(raw).decode('ascii')
 
     def _decrypt_person(self, token):
         payload = json.loads(self.fernet.decrypt(token.encode('ascii')))
         # a régi adatlapokon nincs 'adoazonosito' — ott üres marad
-        return {k: payload.get(k, '') for k in self.PERSON_FIELDS}
+        person = {k: payload.get(k, '') for k in self.PERSON_FIELDS}
+        if 'archive_fields' in payload:
+            person['archive_fields'] = list(payload['archive_fields'] or ())
+        return person
 
     @staticmethod
     def person_doc_id(person):
@@ -516,9 +527,15 @@ class FirebaseStore:
         persons = {}
         for doc in self._list(self._persons_path(company)):
             try:
-                persons[doc['_id']] = self._decrypt_person(doc['payload'])
+                person = self._decrypt_person(doc['payload'])
             except Exception:
                 continue
+            # az utolsó módosítás ideje: összefésüléskor a frissebb adat nyer
+            person['_updated'] = doc.get('_update_time') or ''
+            # a létrehozás ideje: a korábbi archívum-betöltés által létrehozott
+            # (jelöletlen) adatlapok felismeréséhez
+            person['_created'] = doc.get('_create_time') or ''
+            persons[doc['_id']] = person
         return persons
 
     def save_person(self, company, person, old_doc_id=None):
@@ -538,6 +555,28 @@ class FirebaseStore:
             writes.append(self._delete_write(f'{path}/{old_doc_id}'))
         self._commit(writes)
         return doc_id
+
+    def commit_person_changes(self, writes=(), deletes=()):
+        """Több adatlap egyben: 'writes' = (cég, adatlap, régi dok.azonosító
+        vagy None), 'deletes' = (cég vagy None a régi közös listához,
+        dok.azonosító). Így egy személy minden cégnél egyszerre frissül, és a
+        régi listából átvett példány ugyanabban a lépésben törlődik."""
+        ops = []
+        written = set()
+        for company, person, old_doc_id in writes:
+            path = self._persons_path(company)
+            doc_id = self.person_doc_id(person)
+            written.add((company, doc_id))
+            ops.append(self._update_write(f'{path}/{doc_id}', {
+                'payload': self._encrypt_person(person),
+                'updated_at': _now_iso(),
+            }))
+            if old_doc_id and old_doc_id != doc_id:
+                ops.append(self._delete_write(f'{path}/{old_doc_id}'))
+        for company, doc_id in deletes:
+            if (company, doc_id) not in written:
+                ops.append(self._delete_write(f'{self._persons_path(company)}/{doc_id}'))
+        self._commit(ops)
 
     def delete_person(self, company, doc_id):
         self._request('DELETE', f'{self._persons_path(company)}/{doc_id}')

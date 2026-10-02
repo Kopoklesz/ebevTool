@@ -72,7 +72,16 @@ szereplő **foglalkoztatói adószám** alapján történik.
   (nincs kapcsolat), a program nem kérdez, és meglévő adatlapot sem ír felül.
   > A korábbi verziók egyetlen, minden cégre közös listát használtak. Ez
   > „Régi közös lista” fülként látszik; feldolgozáskor az ott már szereplő
-  > személyek kérdés nélkül átkerülnek az adott cég listájába.
+  > személyek kérdés nélkül **átkerülnek** az adott cég listájába (a régi
+  > listából törlődnek, így nem duplikálódnak). Ha a lista kiürül, a fül
+  > eltűnik.
+- **Egy személy több cégnél**: mindegyik cég listájában szerepel, de az
+  adatai mindenhol ugyanazok — ha az egyik cégnél módosítod, a többinél is
+  módosul. Ha feldolgozáskor egy cégnél még ismeretlen személy egy másik
+  cégnél (vagy a régi listában) már szerepel, a program rákérdezés nélkül
+  átveszi az adatait. **Ütközésnél a programban felvitt adat nyer** az
+  archívumból betöltöttel szemben, azon belül a frissebb; hogy egy mező az
+  archívumból jött-e, azt az adatlap megjegyzi.
 - **Munkanapló** (Személyek → 📅 Munkanapló, vagy dupla katt a keresőben a
   személy sorára): személyenként, cégenként a ledolgozott napok száma, első és
   utolsó napja és havi bontásban a dátumok — Excelbe is menthető. Forrása a
@@ -82,11 +91,14 @@ szereplő **foglalkoztatói adószám** alapján történik.
   hónapok a **📥 Régi hónapok az archívumból** gombbal tölthetők be a helyi
   archívum kimeneteiből (ugyanarra a hónapra több fájlnál a legújabb számít;
   a várakozási sorhoz és az előzményekhez nem nyúl). Ugyanez a betöltés a
-  kimenetekben szereplő **személyi adatokat** (szül. név, anyja neve, szül.
-  hely/idő, lakcím) is átveszi: akinek még nincs adatlapja az adott cégnél,
-  annak létrehozza; a meglévő adatlapon csak az **üres** mezőket tölti ki, a
-  már rögzített adatot nem írja felül (az eltéréseket a megerősítő ablak
-  megszámolja). Személyenként a legújabb hónap adata számít.
+  kimenetekben szereplő **személyeket** is felveszi: mindenki bekerül annak
+  a cégnek a listájába, ahol a statisztikában szerepelt (üres adatlappal is,
+  ha a régi kimenetben nem volt személyi adat). Ha a személy már szerepel
+  egy másik cégnél vagy a régi listában, az ott (a programban) rögzített
+  adatai kerülnek át; az archívum csak az **üres** mezőket tölti ki (szül.
+  név, anyja neve, szül. hely/idő, lakcím), a programban felvitt adatot nem
+  írja felül — az eltéréseket a megerősítő ablak megszámolja. Személyenként
+  a legújabb hónap adata számít.
 - **TAJ-szám formátuma**: egységesen kötőjeles, `123-456-789` alakban jelenik
   meg és mentődik (táblázat, munkanapló, a statisztika `Név Szerint` lapja,
   új és szerkesztett adatlapok). A meglévő adatlapokat az **Adatok
@@ -105,7 +117,12 @@ szereplő **foglalkoztatói adószám** alapján történik.
 - **Javított hónap újrafeldolgozása**: ha a következő hónapot már
   feldolgozták, a megváltozott áthúzódó bejelentések régi változata akkor is
   törlődik, és a program szól, hogy a későbbi hónapot is futtasd újra.
-- **🧹 Adatok ellenőrzése** (Személyek oldal): a már rögzített adatlapokra
+- **🧹 Adatok ellenőrzése** (Személyek oldal): az **Összefésülés** fül
+  listázza azokat a személyeket, akik több helyen eltérő adattal szerepelnek,
+  vagy a régi listában is megvannak (pl. egy korábbi archívum-betöltés
+  duplikátumai), és előnézettel mutatja, mi lesz az egységes adat és honnan
+  jön — jóváhagyás után minden cégnél egységes lesz, a régi listából pedig
+  átkerül. Az **Egységesítés** fül a már rögzített adatlapokra
   egységesítési javaslatokat tesz (pl. `KOVÁCS ÉVA` → `Kovács Éva`,
   `1234 BUDAPEST, FŐ UTCA 1.` → `1234 Budapest, Fő utca 1.`, dátum
   `1990.01.05.` alakra) — csak a kijelöltek, megerősítés után kerülnek
