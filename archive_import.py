@@ -583,30 +583,30 @@ def build_import(items, company_resolver):
 # --- 5. személyi adatlapok kinyerése ---
 
 def collect_person_details(imports):
-    """A cégenkénti személyi adatlapok az archívumból.
+    """A cégenkénti személyek az archívumból.
 
-    'imports': a build_import eredményének 'imports' része. Személyenként a
-    LEGÚJABB hónap kitöltött adatai számítanak (mezőnként: ha az újabb
-    hónapban egy mező üres, egy korábbi hónap értéke pótolja).
+    'imports': a build_import eredményének 'imports' része. Mindenki benne
+    van, aki a cég valamelyik (hónaponként legújabb) kimenetében szerepel —
+    akkor is, ha az adatlapja üres volt, hiszen ennél a cégnél dolgozott.
+    Személyenként a LEGÚJABB hónap kitöltött adatai számítanak (mezőnként:
+    ha az újabb hónapban egy mező üres, egy korábbi hónap értéke pótolja).
 
     Visszatérés: {cég: [{'nev', 'adoazonosito', 'taj', 'details': {...}}]} —
-    csak azok, akiknek legalább egy adatlap-mezője ki van töltve.
+    adóazonosító és TAJ nélküli személy nem kerül bele (nem párosítható).
     """
     out = {}
     for (company, ym) in sorted(imports, key=lambda k: k[1], reverse=True):
         people = out.setdefault(company, {})
         for p in imports[(company, ym)]['persons']:
-            if not p.get('details'):
-                continue
             if generate.ado_key(p['adoazonosito']):
                 key = generate.ado_key(p['adoazonosito'])
-            elif generate.taj_key(p['taj']):
+            elif generate.taj_key(p['taj']).isdigit():
                 key = 'taj:' + generate.taj_key(p['taj'])
             else:
-                key = 'nev:' + p['nev'].lower()
+                continue
             cur = people.setdefault(key, {'nev': p['nev'], 'adoazonosito': p['adoazonosito'],
                                           'taj': p['taj'], 'details': {}})
-            for field, value in p['details'].items():
+            for field, value in (p.get('details') or {}).items():
                 cur['details'].setdefault(field, value)
             cur['adoazonosito'] = cur['adoazonosito'] or p['adoazonosito']
             cur['taj'] = cur['taj'] or p['taj']
