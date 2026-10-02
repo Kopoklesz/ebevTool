@@ -17,6 +17,7 @@ betöltött hónapoknál nincs bejelentés-szintű adat, ott ez nem alkalmazhat�
 from datetime import date
 
 import generate
+from normalize import normalize_taj
 
 
 def latest_processing(history_rows):
@@ -190,7 +191,8 @@ def export_xlsx(record, summary, path):
     ws = wb.active
     ws.title = 'Összesítés'
     for label, value in (('Név', record['nev']), ('Adóazonosító', record['adoazonosito']),
-                         ('TAJ-szám', record['taj']), ('Összes munkanap', summary['total_days'])):
+                         ('TAJ-szám', normalize_taj(record['taj'])),
+                         ('Összes munkanap', summary['total_days'])):
         ws.append([label, value])
         ws.cell(row=ws.max_row, column=1).font = bold
     ws.append([])

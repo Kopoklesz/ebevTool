@@ -57,19 +57,21 @@ _YM_DIR_RE = re.compile(r'^(\d{4})[-._ ]?(\d{1,2})$')
 # A statisztika munkalapjai — ezek közül egyik sem a forrásadat-lap.
 _STAT_SHEETS = ('NEV SZERINT', 'DATUM SZERINT', 'KI HANY NAPOT DOLGOZOTT')
 
-# A blokk fejsorainak címkéi (normalizálva) -> mező. A None-ra képzett
-# címkéket felismerjük, de nem használjuk.
+# A blokk fejsorainak címkéi (normalizálva) -> mező.
 _LABELS = {
     'NEV': 'nev',
-    'SZULNEV': None,
-    'ANYJANEVE': None,
-    'SZULHELYIDO': None,
+    'SZULNEV': 'szul_nev',
+    'ANYJANEVE': 'anya_neve',
+    'SZULHELYIDO': 'szul_hely_ido',
     'ADOAZONOSITO': 'adoazonosito',
     'ADOAZONOSITOJEL': 'adoazonosito',
     'TAJSZAM': 'taj',
     'TAJ': 'taj',
-    'LAKCIM': None,
+    'LAKCIM': 'lakcim',
 }
+
+# A személyi adatlap mezői (a régebbi kimenetekben üresek lehetnek).
+DETAIL_FIELDS = ('szul_nev', 'anya_neve', 'szul_hely_ido', 'lakcim')
 
 # Az Excel-serialként tárolt dátumot csak ebben a tartományban fogadjuk el
 # (2000-01-01 .. 2099-12-31), hogy egy darabszámot ne nézzünk dátumnak.
@@ -188,6 +190,8 @@ def _parse_rows(rows, warnings):
             'adoazonosito': block['adoazonosito'],
             'taj': block['taj'],
             'dates': [generate.serial_to_iso(s) for s in unique],
+            # csak a ténylegesen kitöltött adatlap-mezők
+            'details': {f: block[f] for f in DETAIL_FIELDS if block.get(f)},
         })
 
     for idx, row in enumerate(rows, start=1):
@@ -230,6 +234,8 @@ def _parse_rows(rows, warnings):
                 block['adoazonosito'] = _id_text(b)
             elif field == 'taj':
                 block['taj'] = _id_text(b, pad=9)
+            elif field in DETAIL_FIELDS and not _is_blank(b):
+                block[field] = str(b).strip()
             continue
 
         serial = _cell_to_serial(a)
@@ -255,7 +261,9 @@ def parse_statistics_workbook(path):
 
     Visszatérés:
         {'persons': [{'nev': str, 'adoazonosito': str, 'taj': str,
-                      'dates': ['ÉÉÉÉ-HH-NN', ...]}, ...],
+                      'dates': ['ÉÉÉÉ-HH-NN', ...],
+                      'details': {mező: érték} — a kitöltött adatlap-mezők
+                                 (szul_nev, anya_neve, szul_hely_ido, lakcim)}, ...],
          'warnings': [str, ...]}
 
     A dátumok rendezettek és egyediek. Pontosan azok a napok, amelyeket az
@@ -570,3 +578,36 @@ def build_import(items, company_resolver):
         }
 
     return {'imports': imports, 'unresolved': unresolved, 'warnings': warnings}
+
+
+# --- 5. személyi adatlapok kinyerése ---
+
+def collect_person_details(imports):
+    """A cégenkénti személyi adatlapok az archívumból.
+
+    'imports': a build_import eredményének 'imports' része. Személyenként a
+    LEGÚJABB hónap kitöltött adatai számítanak (mezőnként: ha az újabb
+    hónapban egy mező üres, egy korábbi hónap értéke pótolja).
+
+    Visszatérés: {cég: [{'nev', 'adoazonosito', 'taj', 'details': {...}}]} —
+    csak azok, akiknek legalább egy adatlap-mezője ki van töltve.
+    """
+    out = {}
+    for (company, ym) in sorted(imports, key=lambda k: k[1], reverse=True):
+        people = out.setdefault(company, {})
+        for p in imports[(company, ym)]['persons']:
+            if not p.get('details'):
+                continue
+            if generate.ado_key(p['adoazonosito']):
+                key = generate.ado_key(p['adoazonosito'])
+            elif generate.taj_key(p['taj']):
+                key = 'taj:' + generate.taj_key(p['taj'])
+            else:
+                key = 'nev:' + p['nev'].lower()
+            cur = people.setdefault(key, {'nev': p['nev'], 'adoazonosito': p['adoazonosito'],
+                                          'taj': p['taj'], 'details': {}})
+            for field, value in p['details'].items():
+                cur['details'].setdefault(field, value)
+            cur['adoazonosito'] = cur['adoazonosito'] or p['adoazonosito']
+            cur['taj'] = cur['taj'] or p['taj']
+    return {c: list(v.values()) for c, v in out.items() if v}

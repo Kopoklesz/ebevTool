@@ -18,9 +18,11 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 
 import requests
 
+import filename_utils
 from version import (RELEASES_API, RELEASES_PAGE, __version__, is_newer)
 
 TIMEOUT = 15
@@ -33,6 +35,98 @@ ASSET_SUFFIX = '.exe'
 
 class UpdateError(Exception):
     pass
+
+
+# --- frissítési napló ---
+#
+# Ha egy frissítés valakinél elakad, a gépén lévő naplóból derül ki, mi
+# történt: a program és a cserét végző batch is ide ír. A felhasználó
+# beállításai mellé kerül (%APPDATA%\ebevTool\update.log).
+
+LOG_MAX_LINES = 500
+
+
+def log_path():
+    return os.path.join(filename_utils.user_data_dir(), 'update.log')
+
+
+def log(message):
+    """Egy sor a frissítési naplóba (hiba esetén csendben kihagyja)."""
+    try:
+        with open(log_path(), 'a', encoding='utf-8') as f:
+            f.write(f'{time.strftime("%Y-%m-%d %H:%M:%S")} v{__version__} {message}\n')
+    except Exception:
+        pass
+
+
+def _trim_log():
+    """A napló a legutóbbi LOG_MAX_LINES sorra rövidítve."""
+    try:
+        with open(log_path(), encoding='utf-8', errors='replace') as f:
+            lines = f.readlines()
+        if len(lines) > LOG_MAX_LINES:
+            with open(log_path(), 'w', encoding='utf-8') as f:
+                f.writelines(lines[-LOG_MAX_LINES:])
+    except Exception:
+        pass
+
+
+# --- a program többi futó példánya ---
+
+def _process_image_paths():
+    """(pid, .exe útvonal) a gép futó folyamataira (Windows, ctypes)."""
+    import ctypes
+    from ctypes import wintypes
+    psapi = ctypes.WinDLL('psapi')
+    kernel32 = ctypes.WinDLL('kernel32')
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.QueryFullProcessImageNameW.argtypes = (
+        wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD))
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    pids = (wintypes.DWORD * 8192)()
+    needed = wintypes.DWORD()
+    if not psapi.EnumProcesses(pids, ctypes.sizeof(pids), ctypes.byref(needed)):
+        return []
+    result = []
+    buf = ctypes.create_unicode_buffer(32768)
+    for pid in pids[:needed.value // ctypes.sizeof(wintypes.DWORD)]:
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+        if not handle:
+            continue
+        try:
+            size = wintypes.DWORD(len(buf))
+            if kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+                result.append((pid, buf.value))
+        finally:
+            kernel32.CloseHandle(handle)
+    return result
+
+
+def other_instances():
+    """Hány MÁSIK példány fut ugyanebből az .exe-ből (0, ha nem megállapítható).
+
+    Egy csomagolt (onefile) példány két folyamat: a PyInstaller indítója és
+    maga a program, ugyanazzal az .exe-útvonallal — a saját párunkat (ez a
+    folyamat és a szülője) kihagyjuk, a többit párokban számoljuk. Egy korábbi
+    frissítés után még nyitva hagyott példány a '.old' nevű fájlból fut.
+    """
+    if not is_frozen() or sys.platform != 'win32':
+        return 0
+
+    def canon(path):
+        # A frissítő batch a rövid (8.3) úton indítja az új verziót, a többi
+        # példány a hosszún fut — a realpath mindkettőt a teljes alakra hozza.
+        return os.path.normcase(os.path.realpath(path))
+
+    try:
+        exe = canon(current_exe())
+        mine = {os.getpid(), os.getppid()}
+        others = [pid for pid, path in _process_image_paths()
+                  if pid not in mine and canon(path) in (exe, exe + '.old')]
+        return (len(others) + 1) // 2
+    except Exception:
+        return 0
 
 
 def is_frozen():
@@ -218,6 +312,7 @@ def download_asset(info, progress=None):
         _silent_remove(temp_path)
         raise UpdateError('A letöltött fájl üres.')
 
+    log(f"letöltve: v{info.get('version')} ({downloaded} bájt)")
     return temp_path
 
 
@@ -244,6 +339,8 @@ _SWAP_BATCH = """@echo off
 set "TARGET={target}"
 set "SOURCE={source}"
 set "BACKUP=%TARGET%.old"
+set "LOG={log}"
+echo %date% %time% batch: indul >> "%LOG%" 2>nul
 
 rem Megvarjuk, mig a futo peldany kilep es elengedi a fajlt (max ~60 mp).
 set /a TRIES=0
@@ -255,6 +352,7 @@ if exist "%TARGET%" (
     ping -n 2 127.0.0.1 > nul
     goto wait
 )
+echo %date% %time% batch: regi exe atnevezve (%TRIES%. probalkozas) >> "%LOG%" 2>nul
 
 rem A csere: koteten at ez masolas, ezert eltarthat par masodpercig.
 move /y "%SOURCE%" "%TARGET%" > nul 2>&1
@@ -264,18 +362,23 @@ rem A regi peldanyt meg az ujrainditas elott takaritjuk el, hogy ne
 rem zarolhassa az elindulo uj verzio. Ha megis bent marad, a program
 rem indulaskori cleanup_leftovers() hivasa kesobb torli.
 del "%BACKUP%" > nul 2>&1
+if exist "%BACKUP%" echo %date% %time% batch: a .old meg hasznalatban (masik nyitott ablak?) >> "%LOG%" 2>nul
+echo %date% %time% batch: csere kesz, uj verzio inditasa >> "%LOG%" 2>nul
 start "" "%TARGET%"
 goto cleanup
 
 :restore
 rem A csere nem sikerult - visszaallitjuk az eredeti allomanyt.
+echo %date% %time% batch: HIBA - az uj exe nem kerult a helyere, visszaallitas >> "%LOG%" 2>nul
 if exist "%BACKUP%" move /y "%BACKUP%" "%TARGET%" > nul 2>&1
 del "%SOURCE%" > nul 2>&1
+if not exist "%TARGET%" echo %date% %time% batch: HIBA - a visszaallitas sem sikerult, kezi csere kell >> "%LOG%" 2>nul
 if exist "%TARGET%" start "" "%TARGET%"
 goto cleanup
 
 :failed
 rem A futo peldany nem engedte el a fajlt - nem cserelunk, csak takaritunk.
+echo %date% %time% batch: HIBA - a regi exe 60 mp alatt sem volt atnevezheto >> "%LOG%" 2>nul
 del "%SOURCE%" > nul 2>&1
 if exist "%BACKUP%" if not exist "%TARGET%" move /y "%BACKUP%" "%TARGET%" > nul 2>&1
 if exist "%TARGET%" start "" "%TARGET%"
@@ -340,8 +443,14 @@ def apply_update(new_exe_path):
     # a cmd kódlapjától függetlenül megtalálja a fájlokat. Enélkül egy ékezetes
     # felhasználónévnél a csere csendben elbukna. A fájlnév marad (lásd
     # batch_safe_path), különben az új .exe 'STATIS~1.EXE' néven jönne létre.
+    try:
+        os.makedirs(os.path.dirname(log_path()), exist_ok=True)
+    except Exception:
+        pass
     body = _SWAP_BATCH.format(target=batch_safe_path(target),
-                              source=batch_safe_path(new_exe_path))
+                              source=batch_safe_path(new_exe_path),
+                              log=batch_safe_path(log_path()))
+    log(f'csere indul: {target} (másik nyitott példány: {other_instances()})')
     # A batch szövege így végig ASCII — nincs kódlap-függő értelmezés.
     with os.fdopen(fd, 'wb') as f:
         f.write(body.encode('ascii', errors='replace'))
@@ -357,6 +466,7 @@ def apply_update(new_exe_path):
     except Exception as e:
         _silent_remove(batch_path)
         _silent_remove(new_exe_path)
+        log(f'HIBA: a batch nem indult: {e}')
         raise UpdateError(f'A frissítés indítása nem sikerült: {e}') from e
 
 
@@ -370,7 +480,12 @@ def cleanup_leftovers():
         return
     exe = current_exe()
     # A '.old' az .exe mellé kerül (a batch nevezi át) — ez marad a helyén.
-    _silent_remove(exe + '.old')
+    if os.path.exists(exe + '.old'):
+        _silent_remove(exe + '.old')
+        log('elindult a frissítés után'
+            + (' (a .old még nem törölhető: egy régi ablak nyitva van)'
+               if os.path.exists(exe + '.old') else ''))
+    _trim_log()
 
     # A félkész letöltéseket és batch-eket a munkamappában keressük, de a régi
     # verziók még az .exe mellé tették, ezért ott is takarítunk.

@@ -6,6 +6,8 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import PatternFill, Font
 from openpyxl.utils import get_column_letter
 
+from normalize import normalize_taj
+
 EPOCH = datetime(1899, 12, 30)
 
 # --- támogatott bemeneti formátumok ---
@@ -646,7 +648,7 @@ def generate_output(input_path, header, data_rows, entries, output_path=None,
         ws_nev.append(['anyja neve:', p.get('anya_neve', ''), '', '', ''])
         ws_nev.append(['szül.hely, idő:', p.get('szul_hely_ido', ''), '', '', ''])
         ws_nev.append(['adóazonosító:', info['adoazonosito'], '', '', ''])
-        ws_nev.append(['TAJ-szám:', info['taj'], '', '', ''])
+        ws_nev.append(['TAJ-szám:', normalize_taj(info['taj']), '', '', ''])
         ws_nev.append(['lakcím:', p.get('lakcim', ''), '', '', ''])
         ws_nev.append([''] * 5)
         unique_dates = sorted(info['dates'])

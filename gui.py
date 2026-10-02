@@ -840,8 +840,8 @@ class App:
             elif generate.taj_key(taj) and generate.taj_key(person.get('taj')) != generate.taj_key(taj):
                 # Az adóazonosító egyezik, a TAJ nem: valószínűleg elírás. A
                 # kimenetbe a fájl TAJ-a kerül, az adatlap nem változik.
-                self.log(f"Figyelem: {entry['nev']} ({ado}) — a fájlban a TAJ {taj}, "
-                         f"az adatlapon {person.get('taj') or '(üres)'}. Az adóazonosító "
+                self.log(f"Figyelem: {entry['nev']} ({ado}) — a fájlban a TAJ {normalize.normalize_taj(taj)}, "
+                         f"az adatlapon {normalize.normalize_taj(person.get('taj')) or '(üres)'}. Az adóazonosító "
                          'alapján ugyanannak a személynek vettük; ha az adatlap a hibás, '
                          'javítsd a Személyek oldalon.')
 
@@ -1624,6 +1624,23 @@ class App:
 
         def do_install():
             path = state['downloaded']
+            # A többi nyitott ablak nem akadályozza a cserét, de azokban a régi
+            # verzió fut tovább — ezért előbb kérjük a bezárásukat.
+            others = updater.other_instances()
+            while others:
+                answer = messagebox.askyesnocancel(
+                    'Másik ablak is nyitva',
+                    f'Az ebevTool még {others} másik ablakban is fut.\n\n'
+                    'Zárd be azokat, majd nyomd meg az Igen gombot.\n'
+                    'A Nem gombbal mégis folytatod — a többi ablakban addig a régi '
+                    'verzió fut tovább.\nA Mégse megszakítja a frissítést.',
+                    icon='warning', parent=dlg)
+                if answer is None:
+                    return
+                if answer is False:
+                    updater.log(f'frissítés {others} nyitva hagyott másik ablakkal')
+                    break
+                others = updater.other_instances()
             if not messagebox.askokcancel(
                     'Újraindítás',
                     'A frissítés telepítéséhez az alkalmazás bezárul, majd '
@@ -2288,7 +2305,11 @@ class App:
         mindegyik [(fül-felirat, dokumentumazonosító, adatlap), ...].
         """
         state = self.persons_state
-        tokens = self._normalize_text(query).split()
+        # a kötőjellel/ponttal tagolt számot (pl. TAJ: 123-456-789) egyben keressük
+        tokens = []
+        for t in self._normalize_text(query).split():
+            digits = t.replace('-', '').replace('.', '')
+            tokens.append(digits if digits.isdigit() else t)
         matches = []
         for label, company in state['company_of'].items():
             for doc_id, p in state['data'][company].items():
@@ -2334,7 +2355,7 @@ class App:
             ado = next((p.get('adoazonosito') for _, _, p in group if p.get('adoazonosito')), '')
             labels = sorted({label for label, _, _ in group})
             parent = tree.insert('', 'end', text=first.get('nev', ''), open=True,
-                                 values=(ado, first.get('taj', ''), ', '.join(labels)),
+                                 values=(ado, normalize.normalize_taj(first.get('taj', '')), ', '.join(labels)),
                                  tags=('odd' if i % 2 else 'even',))
             taj = next((p.get('taj') for _, _, p in group if p.get('taj')), '')
             people[parent] = (ado, taj, first.get('nev', ''))
@@ -2346,7 +2367,7 @@ class App:
                 other_name = p.get('nev', '') != first.get('nev', '')
                 text = f'🏢  {label}' + (f"  ({p.get('nev', '')})" if other_name else '')
                 child = tree.insert(parent, 'end', text=text,
-                                    values=(p.get('adoazonosito', ''), p.get('taj', ''), ''),
+                                    values=(p.get('adoazonosito', ''), normalize.normalize_taj(p.get('taj', '')), ''),
                                     tags=('odd' if i % 2 else 'even',))
                 items[child] = (label, doc_id)
                 people[child] = (p.get('adoazonosito', ''), p.get('taj', ''), p.get('nev', ''))
@@ -2468,7 +2489,7 @@ class App:
         ttk.Label(head, text=f'📅  {record["nev"] or nev}', background=COLORS['card'],
                   font=FONT_BOLD).pack(anchor='w')
         ttk.Label(head, text=f'Adóazonosító: {record["adoazonosito"] or ado or "—"}   •   '
-                             f'TAJ: {record["taj"] or taj or "—"}',
+                             f'TAJ: {normalize.normalize_taj(record["taj"] or taj) or "—"}',
                   background=COLORS['card'], foreground=COLORS['muted'],
                   font=FONT_BASE).pack(anchor='w')
 
@@ -2747,15 +2768,60 @@ class App:
                 items, lambda folder: archive_import.match_company_folder(folder, known))
             result['warnings'] = warnings + result['warnings']
             result['roots'] = roots
+            result['persons_plan'] = self._plan_archive_persons(
+                archive_import.collect_person_details(result['imports']))
             return result
 
         self.run_async(work, self._confirm_archive_import, 'Archívum átvizsgálása...')
+
+    def _plan_archive_persons(self, details):
+        """Az archívumban talált személyi adatok összevetése a cégek listájával.
+
+        Új adatlap csak akkor készül, ha a cégnél még nincs ilyen személy; a
+        meglévőnél csak az ÜRES mezők töltődnek ki — kitöltött adatot nem írunk
+        felül (az eltéréseket csak megszámoljuk).
+        Visszatérés: {'new': [(cég, adatlap)], 'update': [(cég, adatlap, régi
+        dok.azonosító)], 'conflicts': int}
+        """
+        plan = {'new': [], 'update': [], 'conflicts': 0}
+
+        def same(a, b):
+            return ' '.join(self._normalize_text(a).split()) == ' '.join(self._normalize_text(b).split())
+
+        for company, people in details.items():
+            existing = dict(self.store.load_persons(company))
+            for ap in people:
+                if not (generate.ado_key(ap['adoazonosito']) or generate.taj_key(ap['taj'])):
+                    continue  # azonosító nélkül nem párosítható
+                key, cur = generate.find_person(existing, ap['adoazonosito'], ap['taj'])
+                if cur is None:
+                    person = {'adoazonosito': ap['adoazonosito'],
+                              'taj': normalize.normalize_taj(ap['taj']),
+                              'nev': ap['nev'], **ap['details']}
+                    plan['new'].append((company, person))
+                    existing[FirebaseStore.person_doc_id(person)] = person
+                    continue
+                updated = dict(cur)
+                for field, value in ap['details'].items():
+                    if not (cur.get(field) or '').strip():
+                        updated[field] = value
+                    elif not same(cur.get(field), value):
+                        plan['conflicts'] += 1
+                if (not generate.ado_key(cur.get('adoazonosito'))
+                        and generate.ado_key(ap['adoazonosito'])):
+                    updated['adoazonosito'] = ap['adoazonosito']
+                if updated != cur:
+                    plan['update'].append((company, updated, key))
+                    existing.pop(key, None)
+                    existing[FirebaseStore.person_doc_id(updated)] = updated
+        return plan
 
     def _confirm_archive_import(self, result, error):
         if error:
             messagebox.showerror('Hiba', f'Az archívum átvizsgálása nem sikerült:\n{error}')
             return
         imports = result['imports']
+        plan = result['persons_plan']
         for w in result['warnings']:
             self.log(f'Archívum: {w}')
         for item in result['unresolved']:
@@ -2773,10 +2839,15 @@ class App:
                      '(újrafeltöltött) változat.\n')
         if result['unresolved']:
             text += f"{len(result['unresolved'])} fájl nem azonosítható (lásd a naplót).\n"
-        text += ('\nA betöltött adat csak a munkanaplóhoz kell: a várakozási sorhoz, az '
-                 'előzményekhez és a személyekhez nem nyúl. Ahol egy hónapnak már van '
-                 'felhőben mentett tartalma, ott az számít. Újbóli betöltés felülírja '
-                 'ugyanazt a hónapot.\n\nBetöltöd?')
+        if plan['new'] or plan['update']:
+            text += (f"\nSzemélyi adatok az archívumból: {len(plan['new'])} új adatlap, "
+                     f"{len(plan['update'])} meglévő kiegészítése (csak az üres mezők).\n")
+            if plan['conflicts']:
+                text += (f"{plan['conflicts']} mezőben az archív adat eltér a már rögzítettől — "
+                         'ott a meglévő marad.\n')
+        text += ('\nA munkanaplóhoz betöltött hónapok a várakozási sorhoz és az előzményekhez '
+                 'nem nyúlnak. Ahol egy hónapnak már van felhőben mentett tartalma, ott az '
+                 'számít. Újbóli betöltés felülírja ugyanazt a hónapot.\n\nBetöltöd?')
         if not messagebox.askyesno('Régi hónapok betöltése', text):
             return
 
@@ -2784,22 +2855,40 @@ class App:
             failed = []
             for (company, ym), item in sorted(imports.items()):
                 try:
+                    # a munkanaplóhoz csak a napok kellenek, a személyi adatok nem
                     self.store.save_worklog_import(company, ym, {
                         'source': os.path.basename(item['source']),
-                        'persons': item['persons'],
+                        'persons': [{k: v for k, v in p.items() if k != 'details'}
+                                    for p in item['persons']],
                     })
                 except Exception as e:
                     failed.append(f'{company} {ym}: {e}')
+            for company, person in plan['new']:
+                try:
+                    self.store.save_person(company, person)
+                except Exception as e:
+                    failed.append(f"{company} – {person.get('nev')}: {e}")
+            for company, person, old_doc_id in plan['update']:
+                try:
+                    self.store.save_person(company, person, old_doc_id=old_doc_id)
+                except Exception as e:
+                    failed.append(f"{company} – {person.get('nev')}: {e}")
             return failed
 
         def done(failed, error):
             self.worklog_cache = None
             if error or failed:
-                messagebox.showerror('Hiba', 'Néhány hónap betöltése nem sikerült:\n'
+                messagebox.showerror('Hiba', 'Néhány elem betöltése nem sikerült:\n'
                                      + (str(error) if error else '\n'.join(failed[:10])))
                 return
-            self.log(f'Archívum: {len(imports)} hónap betöltve a munkanaplóba.')
-            messagebox.showinfo('Kész', f'{len(imports)} hónap betöltve a munkanaplóba.')
+            summary = f'{len(imports)} hónap betöltve a munkanaplóba.'
+            if plan['new'] or plan['update']:
+                summary += (f"\nSzemélyi adatok: {len(plan['new'])} új adatlap, "
+                            f"{len(plan['update'])} kiegészítve.")
+            self.log('Archívum: ' + summary.replace('\n', ' '))
+            messagebox.showinfo('Kész', summary)
+            if self.current_page == 'persons':
+                self.show_persons()
 
         self.run_async(work, done, 'Betöltés...')
 
@@ -2813,9 +2902,9 @@ class App:
         for i, (key, p) in enumerate(sorted(persons.items(),
                                             key=lambda x: x[1].get('nev', '').lower())):
             tree.insert('', 'end', iid=key, text=p.get('nev', ''),
-                        values=(p.get('adoazonosito', ''), p.get('taj', ''), p.get('szul_nev', ''),
-                                p.get('anya_neve', ''), p.get('szul_hely_ido', ''),
-                                p.get('lakcim', '')),
+                        values=(p.get('adoazonosito', ''), normalize.normalize_taj(p.get('taj', '')),
+                                p.get('szul_nev', ''), p.get('anya_neve', ''),
+                                p.get('szul_hely_ido', ''), p.get('lakcim', '')),
                         tags=('odd' if i % 2 else 'even',))
         self._autosize_columns(tree)
 
@@ -2949,6 +3038,7 @@ class App:
             bad = []
             if updated['adoazonosito'] and not normalize.valid_adoazonosito(updated['adoazonosito']):
                 bad.append(f"Az adóazonosító ({updated['adoazonosito']})")
+            updated['taj'] = normalize.normalize_taj(updated['taj'])
             if updated['taj'] and not normalize.valid_taj(updated['taj']):
                 bad.append(f"A TAJ-szám ({updated['taj']})")
             if bad and not messagebox.askyesno(
@@ -3000,7 +3090,8 @@ class App:
         if position and position[1] > 1:
             heading += f'  ({position[0]} / {position[1]})'
         ttk.Label(dlg, text=heading, background=COLORS['card'], font=FONT_BOLD).pack()
-        ttk.Label(dlg, text=f'{nev}  •  Adóazonosító: {adoazonosito or "—"}  •  TAJ: {taj or "—"}',
+        ttk.Label(dlg, text=f'{nev}  •  Adóazonosító: {adoazonosito or "—"}  •  '
+                            f'TAJ: {normalize.normalize_taj(taj) or "—"}',
                   background=COLORS['card'],
                   foreground=COLORS['muted'], font=FONT_BASE).pack(pady=(2, 4))
         ttk.Label(dlg, text='Add meg az adatait, vagy hagyd üresen és nyomj OK-t.\n'
@@ -3032,7 +3123,8 @@ class App:
             # statisztikába, csak az adatlapja marad kitöltetlen. Az üres
             # profilt is elmentjük, így legközelebb nem kérdez rá újra.
             values = {k: v.get().strip() for k, v in vars_.items()}
-            result['data'] = {'adoazonosito': adoazonosito, 'taj': taj, 'nev': nev, **values}
+            result['data'] = {'adoazonosito': adoazonosito, 'taj': normalize.normalize_taj(taj),
+                              'nev': nev, **values}
             dlg.destroy()
 
         def do_skip_all():

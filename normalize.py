@@ -324,6 +324,19 @@ def normalize_id(text):
     return s
 
 
+def normalize_taj(text):
+    """TAJ-szám egységes, kötőjeles alakban: '123-456-789'.
+
+    Csak a pontosan 9 számjegyből álló értéket alakítja (elválasztóktól
+    függetlenül); minden mást a normalize_id szerint hagy. Az összehasonlítás
+    (taj_key) a számjegyekre épül, így ez az azonosítást nem befolyásolja.
+    """
+    s = normalize_id(text)
+    if re.fullmatch(r'[0-9]{9}', s):
+        return f'{s[:3]}-{s[3:6]}-{s[6:]}'
+    return s
+
+
 def valid_adoazonosito(text):
     """Magyar adóazonosító jel: 10 számjegy, 8-assal kezdődik; az első 9
     jegy helyiértékkel (1..9) szorzott összege mod 11 = 10. jegy (10 → hibás)."""
@@ -353,7 +366,7 @@ _FIELD_FUNCS = {
     'szul_hely_ido': normalize_place_date,
     'lakcim': normalize_address,
     'adoazonosito': normalize_id,
-    'taj': normalize_id,
+    'taj': normalize_taj,
 }
 
 # A hiányzó-adat figyelmeztetésben szereplő mezők, sorrendben.
