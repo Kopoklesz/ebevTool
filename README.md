@@ -81,7 +81,18 @@ szereplő **foglalkoztatói adószám** alapján történik.
   kihúztak belőle valakit), a korábbi verzió nem számít. A 2026.10.01 előtti
   hónapok a **📥 Régi hónapok az archívumból** gombbal tölthetők be a helyi
   archívum kimeneteiből (ugyanarra a hónapra több fájlnál a legújabb számít;
-  a várakozási sorhoz és az előzményekhez nem nyúl).
+  a várakozási sorhoz és az előzményekhez nem nyúl). Ugyanez a betöltés a
+  kimenetekben szereplő **személyi adatokat** (szül. név, anyja neve, szül.
+  hely/idő, lakcím) is átveszi: akinek még nincs adatlapja az adott cégnél,
+  annak létrehozza; a meglévő adatlapon csak az **üres** mezőket tölti ki, a
+  már rögzített adatot nem írja felül (az eltéréseket a megerősítő ablak
+  megszámolja). Személyenként a legújabb hónap adata számít.
+- **TAJ-szám formátuma**: egységesen kötőjeles, `123-456-789` alakban jelenik
+  meg és mentődik (táblázat, munkanapló, a statisztika `Név Szerint` lapja,
+  új és szerkesztett adatlapok). A meglévő adatlapokat az **Adatok
+  ellenőrzése** alakítja át. A keresés és az azonosítás a számjegyekre épül,
+  így kötőjellel és anélkül is talál. A `Bejelentés adatok` lap a forrásfájl
+  változatlan másolata, ott a TAJ az eredeti alakjában marad.
 - **Visszavonások**: egy (adóazonosító — híján TAJ —, kezdő nap) bejelentés
   érvénytelen, ha utána ugyanerre visszavonás/törlés jött — akár ugyanabban a
   fájlban, akár egy későbbi hónap fájljában. A visszavonás utáni újbóli „Új”
@@ -290,6 +301,12 @@ A verziószám formátuma `ÉÉÉÉ.HH.NN`, egy napon belüli több kiadásnál
 Ha egy kiadáshoz nincs `.exe` csatolva, az app ezt jelzi, és felkínálja a
 kiadási oldal megnyitását — kézzel akkor is frissíthető. Forrásból futtatva
 (`python gui.py`) az automatikus csere nem működik, ilyenkor `git pull` kell.
+
+Telepítés előtt a program megnézi, fut-e még másik ablaka: ha igen, kéri a
+bezárásukat (a csere ettől még működne, de azokban a régi verzió futna
+tovább). A frissítés minden lépése — a cserét végző batch-é is — a
+`%APPDATA%\ebevTool\update.log` naplóba kerül (a legutóbbi 500 sor), így ha
+valakinél elakad, abból kiderül, mi történt.
 
 ## Megjegyzés
 
