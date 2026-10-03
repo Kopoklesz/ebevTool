@@ -2932,8 +2932,7 @@ class App:
                      'meglévő kiegészítése vagy hozzárendelése a cégéhez. Mindenki bekerül annak '
                      'a cégnek a listájába, ahol a statisztikában szerepelt.\n')
             if plan['conflicts']:
-                text += (f"{plan['conflicts']} mezőben az archív adat eltér a programban "
-                         'felvitttől — ott a programban felvitt marad.\n')
+                text += 'Ahol az archív adat eltér, a programban felvitt marad.\n'
         if year_tables:
             text = text.rstrip('\n') + '\n\n'
             text += 'Éves táblák („ki hány napot dolgozott”) — csak a havi statisztika nélküli hónapokhoz:\n'
