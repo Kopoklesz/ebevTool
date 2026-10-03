@@ -282,9 +282,19 @@ def parse_statistics_workbook(path):
         ws = _find_sheet(wb, NEV_SZERINT)
         if ws is None:
             raise ValueError(f"A fájlban nincs '{NEV_SZERINT}' munkalap: {path}")
-        rows = list(ws.iter_rows(max_col=2, values_only=True))
+        rows = list(ws.iter_rows(max_col=6, values_only=True))
     finally:
         wb.close()
+    # A kézzel vezetett munkafüzetekben a tábla eltolva is kezdődhet (pl. a
+    # címkék a B oszlopban): az első 'név:' címke oszlopától olvasunk.
+    offset = 0
+    for row in rows[:50]:
+        hit = next((c for c, v in enumerate(row[:4]) if _label_key(v) == 'NEV'), None)
+        if hit is not None:
+            offset = hit
+            break
+    rows = [tuple(row[offset:offset + 2]) + (None,) * max(0, 2 - len(row[offset:offset + 2]))
+            for row in rows]
     persons = _parse_rows(rows, warnings)
     persons.sort(key=lambda p: p['nev'].lower())
     return {'persons': persons, 'warnings': warnings}
@@ -611,3 +621,134 @@ def collect_person_details(imports):
             cur['adoazonosito'] = cur['adoazonosito'] or p['adoazonosito']
             cur['taj'] = cur['taj'] or p['taj']
     return {c: list(v.values()) for c, v in out.items() if v}
+
+
+# --- 6. éves táblák ('ki hány napot dolgozott') ---
+#
+# A kézzel vezetett munkafüzetek (és a program kimenetei) éves táblájából a
+# havi napszámok kiolvashatók. Ezeket csak azokra a hónapokra használjuk,
+# amelyekhez nincs havi statisztika (lásd worklog.prior_year_days).
+
+YEAR_SHEET = 'ki hány napot dolgozott'
+_MONTH_KEYS = ('JANUAR', 'FEBRUAR', 'MARCIUS', 'APRILIS', 'MAJUS', 'JUNIUS', 'JULIUS',
+               'AUGUSZTUS', 'SZEPTEMBER', 'OKTOBER', 'NOVEMBER', 'DECEMBER')
+
+
+def _header_month(value):
+    """(év vagy None, hónap) egy fejléccellából: dátum vagy hónapnév."""
+    if isinstance(value, (datetime, date)):
+        return value.year, value.month
+    key = _label_key(value)
+    for i, name in enumerate(_MONTH_KEYS, start=1):
+        if key == name or (len(key) >= 3 and name.startswith(key) and key != 'MA'):
+            return None, i
+    return None, None
+
+
+def parse_year_table(path):
+    """Az éves tábla beolvasása.
+
+    Visszatérés: {'year': int vagy None, 'persons': [{'nev', 'adoazonosito',
+    'taj', 'months': {hónap: napok}}], 'warnings': [...]}, vagy None, ha a
+    fájlban nincs ilyen lap. A napok a hónap-oszlop előtti ('Nap') oszlopban
+    vannak, a név a sor elején; az alatta lévő összeg-sort nem olvassuk.
+    Az azonosítókat a fájl 'Név Szerint' lapjáról párosítjuk a névhez.
+    """
+    wb = _open(path)
+    try:
+        ws = _find_sheet(wb, YEAR_SHEET)
+        if ws is None:
+            return None
+        rows = list(ws.iter_rows(max_col=40, values_only=True))
+    finally:
+        wb.close()
+    warnings = []
+    header_idx, columns, years = None, {}, []
+    for i, row in enumerate(rows[:6]):
+        if row and _label_key(row[0]) == 'NEV':
+            header_idx = i
+            for c, value in enumerate(row):
+                year, month = _header_month(value)
+                if month and c >= 1:
+                    columns[month] = c - 1          # a napok a fejléc előtti oszlopban
+                    if year:
+                        years.append(year)
+            break
+    if header_idx is None or not columns:
+        return {'year': None, 'persons': [], 'warnings': ['nem ismerhető fel a fejléc']}
+
+    ids = {}
+    try:
+        for p in parse_statistics_workbook(path)['persons']:
+            ids[_loose_key(p['nev'])] = (p['adoazonosito'], p['taj'])
+    except Exception:
+        pass
+
+    persons = []
+    for row in rows[header_idx + 1:]:
+        name = row[0] if row else None
+        if not isinstance(name, str) or not name.strip():
+            continue
+        months = {}
+        for month, col in columns.items():
+            value = row[col] if col < len(row) else None
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+                months[month] = int(value)
+        ado, taj = ids.get(_loose_key(name), ('', ''))
+        persons.append({'nev': name.strip(), 'adoazonosito': ado, 'taj': taj, 'months': months})
+    year = max(set(years), key=years.count) if years else None
+    return {'year': year, 'persons': persons, 'warnings': warnings}
+
+
+def build_year_tables(items, company_resolver):
+    """Cégenként és évenként az éves táblák havi napszámai.
+
+    Hónaponként a LEGÚJABB (módosítási idő) olyan fájl számít, amelyikben az
+    adott hónapban van adat — egy későbbi, javított munkafüzet így felülírja a
+    korábbit, de egy régebbi hónapot csak az tölt ki, amelyikben szerepel.
+
+    Visszatérés: {(cég, év): {'sources': {hónap: útvonal},
+                              'persons': [{'nev', 'adoazonosito', 'taj',
+                                           'months': {hónap: napok}}]}}
+    """
+    per_key = {}
+    for item in items:
+        try:
+            company = company_resolver(item.get('company_folder'))
+        except Exception:
+            company = None
+        if not company:
+            continue
+        try:
+            table = parse_year_table(item['path'])
+        except Exception:
+            continue
+        if not table or not table['persons']:
+            continue
+        year = table['year']
+        if year is None and item.get('ym'):
+            year = int(item['ym'][:4])
+        if year is None:
+            continue
+        per_key.setdefault((company, year), []).append((item['mtime'], item['path'], table))
+
+    result = {}
+    for key, tables in per_key.items():
+        tables.sort(key=lambda t: (t[0], t[1]), reverse=True)
+        sources, people = {}, {}
+        for month in range(1, 13):
+            for mtime, path, table in tables:
+                if any(p['months'].get(month) for p in table['persons']):
+                    sources[month] = path
+                    for p in table['persons']:
+                        if p['months'].get(month):
+                            pk = (generate.ado_key(p['adoazonosito'])
+                                  or 'nev:' + _loose_key(p['nev']))
+                            entry = people.setdefault(pk, {'nev': p['nev'],
+                                                           'adoazonosito': p['adoazonosito'],
+                                                           'taj': p['taj'], 'months': {}})
+                            entry['months'][month] = p['months'][month]
+                    break
+        if sources:
+            result[key] = {'sources': sources, 'persons': list(people.values())}
+    return result

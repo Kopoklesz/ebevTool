@@ -220,3 +220,57 @@ def export_xlsx(record, summary, path):
     for sheet in (ws, days):
         generate.autofit(sheet)
     wb.save(path)
+
+
+def counts_for_year(stat_ym, ym):
+    """Kell-e a 'stat_ym' havi statisztika az 'ym' évének táblájához: az év
+    'ym' előtti hónapjai, és az előző év decembere (abból átnyúlhat januárra)."""
+    year = int(ym[:4])
+    return stat_ym < ym and (stat_ym[:4] == ym[:4] or stat_ym == f'{year - 1}-12')
+
+
+def prior_year_days(company, snapshots, imports, ym, year_tables=None, resolve=None):
+    """Az év korábbi hónapjainak napjai a 'ki hány napot dolgozott' táblához.
+
+    'snapshots' / 'imports': a cég hónaponkénti mentett tartalmai, illetve az
+    archívumból betöltött hónapjai (bármelyik hónapra; itt szűrünk). Csak az
+    'ym' évének a 'ym'-nél KORÁBBI hónapjai számítanak — a mostani hónapot a
+    feldolgozás maga adja.
+    Azokra a hónapokra, amelyekhez nincs havi statisztika, a kézi
+    munkafüzetekből betöltött éves tábla ('year_tables': {év: {'persons': [...
+    'months': {hónap: napok}]}}) napszámai kerülnek; ahol ez sincs, üres marad.
+    'resolve(név) -> (adóazonosító, TAJ)': az éves táblában csak névvel
+    szereplők azonosítása (hogy ugyanabba a sorba kerüljenek).
+    Visszatérés: [{'nev', 'adoazonosito', 'taj', 'dates': ['ÉÉÉÉ-HH-NN']}
+    vagy {..., 'months': {'ÉÉÉÉ-HH': napok}}].
+    """
+    year = ym[:4]
+    wanted = lambda m: counts_for_year(m, ym)
+    data = {company: {
+        'snapshots': {m: v for m, v in (snapshots or {}).items() if wanted(m)},
+        'imports': {m: v for m, v in (imports or {}).items() if wanted(m)},
+    }}
+    out = []
+    for person in build(data).values():
+        days = (person['companies'].get(company) or {}).get('days') or {}
+        dates = sorted(d.isoformat() for d, stat_ym in days.items()
+                       if wanted(stat_ym) and str(d.year) == year)
+        if dates:
+            out.append({'nev': person['nev'], 'adoazonosito': person['adoazonosito'],
+                        'taj': person['taj'], 'dates': dates})
+
+    covered = set(data[company]['snapshots']) | set(data[company]['imports'])
+    table = (year_tables or {}).get(year) or (year_tables or {}).get(int(year)) or {}
+    for p in table.get('persons') or ():
+        months = {}
+        for m, n in (p.get('months') or {}).items():
+            m_ym = f'{year}-{int(m):02d}'
+            if m_ym < ym and m_ym not in covered and n:
+                months[m_ym] = int(n)
+        if months:
+            ado, taj = p.get('adoazonosito', ''), p.get('taj', '')
+            if not ado and resolve:
+                ado, taj = resolve(p.get('nev', '')) or (ado, taj)
+            out.append({'nev': p.get('nev', ''), 'adoazonosito': ado, 'taj': taj,
+                        'months': months})
+    return out

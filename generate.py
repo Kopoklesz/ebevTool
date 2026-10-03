@@ -546,15 +546,24 @@ def entries_from_json(items):
     } for i in items]
 
 
-def build_snapshot(header, data_rows, entries, fmt):
-    """A 'generate_output' bemeneteiből JSON-ra alakítható snapshot."""
-    return {
+def build_snapshot(header, data_rows, entries, fmt, prior=None, year=None):
+    """A 'generate_output' bemeneteiből JSON-ra alakítható snapshot.
+
+    Az éves táblához használt előző hónapok ('prior') is bekerülnek, így a
+    munkafüzet később pontosan ugyanígy állítható elő — akkor is, ha egy
+    korábbi hónapot azóta újra feldolgoztak.
+    """
+    snapshot = {
         'v': 1,
         'fmt': fmt.key,
         'header': [_cell_to_json(c) for c in (header or [])],
         'data_rows': rows_to_json(data_rows),
         'entries': entries_to_json(entries),
     }
+    if prior is not None:
+        snapshot['prior'] = prior
+        snapshot['year'] = year
+    return snapshot
 
 
 def snapshot_to_args(snapshot):
@@ -565,6 +574,9 @@ def snapshot_to_args(snapshot):
         'data_rows': rows_from_json(snapshot.get('data_rows') or []),
         'entries': entries_from_json(snapshot.get('entries') or []),
         'fmt': format_by_key(snapshot.get('fmt')),
+        # régebbi snapshotban nincs: ilyenkor a hívó tölti az előző hónapokat
+        'prior': snapshot.get('prior'),
+        'year': snapshot.get('year'),
     }
 
 
@@ -585,8 +597,115 @@ def content_hash(path):
     return h.hexdigest()
 
 
+MONTH_NAMES = ('Január', 'Február', 'Március', 'Április', 'Május', 'Június',
+               'Július', 'Augusztus', 'Szeptember', 'Október', 'November', 'December')
+
+
+def _person_row_key(adoazonosito, taj, nev):
+    ado = ado_key(adoazonosito)
+    if ado:
+        return 'ado:' + ado
+    t = taj_key(taj)
+    return 'taj:' + t if t else 'nev:' + (nev or '').strip().lower()
+
+
+def _write_year_sheet(ws, entries, prior, year):
+    """A 'ki hány napot dolgozott' éves tábla a minta szerint.
+
+    1. sor üres; 2. sor: 'név', majd havonta két oszlop (a hónap neve az
+    összeg-oszlop fölött), végül 'bérkifizetés' és 'munkanapok'; 3. sor:
+    'Nap' / 'Összeg' és 'összesen'. Személyenként két sor: a névsorban a
+    havi napok és a munkanapok összege (képlet), alatta az összeg-sor — ezt
+    a felhasználó tölti, az összesítő képlet összeadja.
+    A hónapokat a nap naptári hónapja szerint számoljuk.
+    """
+    # (adóazonosító, TAJ, név, napok, havi napszámok) — a korábbi hónapok előbb,
+    # a mostani hónap utolsóként (a név innen nyer)
+    records = [(p.get('adoazonosito', ''), p.get('taj', ''), p.get('nev', ''),
+                [iso_to_serial(d) for d in p.get('dates') or ()], p.get('months') or {})
+               for p in prior or ()]
+    records += [(e['adoazonosito'], e['taj'], e['nev'],
+                 [e['start_serial'] + i for i in range(e['munkanapok'])], {})
+                for e in entries]
+
+    # Ugyanaz az ember egy sorba: a csak TAJ-jal vagy csak névvel szereplő
+    # bejegyzés az adóazonosítós személyhez kerül, ha a TAJ / a név egyezik.
+    by_taj, by_name = {}, {}
+    for ado, taj, nev, _, _ in records:
+        if ado_key(ado):
+            if taj_key(taj).isdigit():
+                by_taj.setdefault(taj_key(taj), _person_row_key(ado, '', ''))
+            by_name.setdefault(' '.join((nev or '').lower().split()), _person_row_key(ado, '', ''))
+
+    people = {}
+    for ado, taj, nev, serials, months in records:
+        if ado_key(ado):
+            key = _person_row_key(ado, '', '')
+        elif taj_key(taj).isdigit() and taj_key(taj) in by_taj:
+            key = by_taj[taj_key(taj)]
+        else:
+            key = by_name.get(' '.join((nev or '').lower().split())) or _person_row_key(ado, taj, nev)
+        person = people.setdefault(key, {'nev': nev, 'dates': set(), 'counts': {}})
+        person['nev'] = nev or person['nev']
+        person['dates'].update(serials)
+        for ym_, n in months.items():
+            person['counts'][ym_] = n
+
+    if year is None:
+        years = [serial_to_date(s).year for p in people.values() for s in p['dates']]
+        years += [int(k[:4]) for p in people.values() for k in p['counts']]
+        year = max(set(years), key=years.count) if years else datetime.now().year
+
+    first_day_col, last_amount_col = 2, 1 + 2 * 12          # B .. Y
+    pay_col, days_col = last_amount_col + 1, last_amount_col + 2   # Z, AA
+    ws.append([])
+    # a hónap neve az összeg-oszlop fölött van (C, E, …), mint a mintában
+    ws.append(['név'] + [x for name in MONTH_NAMES for x in ('', name)]
+              + ['bérkifizetés', 'munkanapok'])
+    ws.append(['', 'Nap', 'Összeg'] + [''] * (last_amount_col - 3) + ['összesen', 'összesen'])
+
+    bold = Font(bold=True)
+    for cell in list(ws[2]) + list(ws[3]):
+        cell.font = bold
+
+    for person in sorted(people.values(), key=lambda p: p['nev'].lower()):
+        by_month = {}
+        for s in person['dates']:
+            d = serial_to_date(s)
+            if d.year == year:
+                by_month[d.month] = by_month.get(d.month, 0) + 1
+        for ym_, n in person['counts'].items():      # kézi éves táblából
+            if int(ym_[:4]) == year and int(ym_[5:7]) not in by_month:
+                by_month[int(ym_[5:7])] = n
+        if not by_month:
+            continue
+        r = ws.max_row + 1
+        ws.cell(row=r, column=1).value = person['nev']
+        for month, days in by_month.items():
+            ws.cell(row=r, column=first_day_col + 2 * (month - 1)).value = days
+        last = get_column_letter(last_amount_col)
+        ws.cell(row=r, column=days_col).value = f'=SUM(B{r}:{last}{r})'
+        ws.cell(row=r + 1, column=pay_col).value = f'=SUM(C{r + 1}:{last}{r + 1})'
+
+    # oszlopszélességek a minta szerint
+    longest = max([len('név')] + [len(p['nev']) for p in people.values()])
+    ws.column_dimensions['A'].width = max(15, longest + 2)
+    for m in range(12):
+        ws.column_dimensions[get_column_letter(first_day_col + 2 * m)].width = 4.3
+        ws.column_dimensions[get_column_letter(first_day_col + 2 * m + 1)].width = 11
+    ws.column_dimensions[get_column_letter(pay_col)].width = 13
+    ws.column_dimensions[get_column_letter(days_col)].width = 12
+
+
 def generate_output(input_path, header, data_rows, entries, output_path=None,
-                    fmt=DEFAULT_FORMAT, persons=None):
+                    fmt=DEFAULT_FORMAT, persons=None, prior=None, year=None):
+    """A statisztika-munkafüzet.
+
+    'prior': az év korábbi hónapjainak napjai a 'ki hány napot dolgozott'
+    éves táblához — [{'nev', 'adoazonosito', 'taj', 'dates': ['ÉÉÉÉ-HH-NN']}]
+    (a mentett előző hónapokból; lásd worklog.prior_year_days). 'year': a
+    tábla éve (alapból a feldolgozott napok leggyakoribb éve).
+    """
     persons = persons or {}
     by_date = {}
     by_name = {}
@@ -603,7 +722,6 @@ def generate_output(input_path, header, data_rows, entries, output_path=None,
 
     sorted_dates = sorted(by_date.keys())
     sorted_names = sorted(by_name.keys(), key=lambda x: x.lower())
-    month_serials = sorted(set(serial_to_month_serial(s) for s in sorted_dates))
 
     wb_out = Workbook()
     wb_out.remove(wb_out.active)
@@ -657,42 +775,14 @@ def generate_output(input_path, header, data_rows, entries, output_path=None,
         ws_nev.append(['', len(unique_dates), '', '', ''])
         ws_nev.append([''] * 5)
 
-    # Ki hány napot dolgozott
+    # Ki hány napot dolgozott — éves tábla (január–december), az előző
+    # hónapok napjaival együtt (lásd _write_year_sheet)
     ws_hany = wb_out.create_sheet('ki hány napot dolgozott')
-    header1 = ['név', '']
-    for ms in month_serials:
-        header1 += [serial_to_date(ms), '']
-    header1 += ['bérkifizetés', 'munkanapok', '']
-    ws_hany.append(header1)
-
-    header2 = ['', 'Nap']
-    for _ in month_serials:
-        header2 += ['Összeg', '']
-    header2 += ['összesen', 'összesen', '']
-    ws_hany.append(header2)
-
-    for nev in sorted_names:
-        info = by_name[nev]
-        by_month = {}
-        for serial in info['dates']:
-            ms = serial_to_month_serial(serial)
-            by_month[ms] = by_month.get(ms, 0) + 1
-
-        nap_row = [nev]
-        total_nap = 0
-        for ms in month_serials:
-            nap = by_month.get(ms, '')
-            nap_row += [nap, '']
-            if nap:
-                total_nap += nap
-        nap_row += ['', total_nap, '']
-        ws_hany.append(nap_row)
-
-        ossze_row = [''] + ['', ''] * len(month_serials) + ['', '', '']
-        ws_hany.append(ossze_row)
+    _write_year_sheet(ws_hany, entries, prior, year)
 
     for ws in wb_out.worksheets:
-        autofit(ws)
+        if ws is not ws_hany:
+            autofit(ws)
 
     if output_path is None:
         import os

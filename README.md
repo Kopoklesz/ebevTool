@@ -52,9 +52,12 @@ szereplő **foglalkoztatói adószám** alapján történik.
 - **Várakozási sor / Böngésző** nézet: a Firestore-ban tárolt rekordok
   dekódolt böngészése és manuális törlése.
 - **Személyek** nézet: **adóazonosítóhoz** kötött, titkosítva tárolt személyi
-  adatok (szül. név, anyja neve, szül. hely/idő, lakcím), **cégenként külön
-  listában** (cégválasztó fülekkel; a széles táblázat vízszintesen
-  görgethető). A személyt az adóazonosító azonosítja, mert azt ritkábban
+  adatok (szül. név, anyja neve, szül. hely/idő, lakcím). **Egy ember = egy
+  adatlap**: aki több cégnél dolgozik, annak is egyetlen adatlapja van, a
+  cégfülek ugyanazt mutatják, így egy módosítás mindenhol egyszerre látszik
+  (a széles táblázat vízszintesen görgethető). A régi, cégenkénti és közös
+  listák az első indításkor automatikusan egybeolvadnak (előtte mentés
+  készül). A személyt az adóazonosító azonosítja, mert azt ritkábban
   írják el, mint a TAJ-számot: ha a TAJ eltér az adatlapon tárolttól, a
   program figyelmeztet, de nem kérdez újra. A TAJ csak tartalék (adóazonosító
   nélküli sornál, illetve a régi, csak TAJ-jal rögzített adatlapoknál — ezek
@@ -155,7 +158,11 @@ szereplő **foglalkoztatói adószám** alapján történik.
 | forrásadat lap            | Az eredeti sorok, a törölt/hibás rekordok kiemelve — a lap neve a bemenettel egyezik (`Bejelentés adatok` vagy `e-bev`) |
 | `Dátum Szerint`           | Naponként kik dolgoztak                                   |
 | `Név Szerint`             | Személyenként a ledolgozott napok, a Személyek nézetből kitöltött adatlappal |
-| `ki hány napot dolgozott` | Havi bontású összesítés személyenként                     |
+| `ki hány napot dolgozott` | Éves tábla (január–december): havi napszámok személyenként, az év korábbi hónapjaival együtt |
+
+Az éves tábla korábbi hónapjai a cég mentett havi statisztikáiból jönnek;
+ahol ilyen nincs, ott az archívumból betöltött kézi munkafüzetek
+`ki hány napot dolgozott` lapjából (hónaponként a legújabb fájl számít).
 
 A kimenet a bemeneti fájl mellé kerül `<fájlnév>_statisztika.xlsx` néven,
 plusz egy másolat az archívum mappába.
@@ -333,7 +340,7 @@ kötve, más gépre vagy fiókba átmásolva olvashatatlanok, és csak a Beáll�
 ablakon keresztül szerkeszthetők.
 
 A Firestore-ban a **várakozási sor** (titkosítva, max. fél éves megőrzéssel), a
-**személyi adatlapok** (titkosítva, cégenként, adóazonosítóhoz kötve) és a feldolgozott hónapok
+**személyi adatlapok** (titkosítva, személyenként egy, adóazonosítóhoz kötve) és a feldolgozott hónapok
 **statisztika-tartalma** (titkosítva) tárolódik. Mindhármat ugyanaz a Fernet
 kulcs védi — ha ez elvész, az adatok visszafejthetetlenné válnak.
 
