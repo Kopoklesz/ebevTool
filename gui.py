@@ -137,13 +137,10 @@ service cloud.firestore {
 
 FIREBASE_CONSOLE_URL = 'https://console.firebase.google.com/'
 
-# A Személyek nézet füle a régi, minden cégre közös személylistának.
-LEGACY_PERSONS_TAB = '📦 Régi közös lista'
-
-def gui_where(company):
-    """A régi közös lista (None) és a cégek felirata a táblázatokban."""
-    return LEGACY_PERSONS_TAB if company is None else company
-
+# A Személyek nézet füle az egyik céghez sem tartozó személyeknek (ide
+# kerültek a régi, minden cégre közös lista azon tagjai is, akik még egyik
+# cégnél sem szerepeltek).
+LEGACY_PERSONS_TAB = '📦 Cég nélküli személyek'
 
 # Az ismeretlen-személy dialógus jelzése: a hátralévőket se kérdezze meg.
 SKIP_ALL = object()
@@ -331,6 +328,8 @@ class App:
             self.store = FirebaseStore(config.FIREBASE_API_KEY,
                                        config.FIREBASE_PROJECT_ID,
                                        config.FERNET_KEY)
+            # az átköltöztetés a csak helyben ismert cégeket is lássa
+            self.store.extra_companies = lambda: list(filename_utils.load_local_aliases().values())
         else:
             self.store = None
 
@@ -741,8 +740,8 @@ class App:
             'Adatok betöltése...')
 
     def _load_context_work(self, ctx):
-        """A cég személyei, a régi közös személylista és a cég adott havi előzményei."""
-        result = {'online': False, 'persons': {}, 'legacy_persons': {}, 'history': [],
+        """A személyek (egy ember = egy adatlap), ebből a cég tagjai, és a cég adott havi előzményei."""
+        result = {'online': False, 'people': {}, 'persons': {}, 'history': [],
                   'processed_months': set()}
         if not self.store:
             return result
@@ -750,26 +749,18 @@ class App:
         if not online:
             return result
         try:
-            result['persons'] = self.store.load_persons(ctx['company'])
-            # Csak akkor kérdezünk és mentünk személyt, ha a cég listáját
+            # Csak akkor kérdezünk és mentünk személyt, ha a személyeket
             # ténylegesen be tudtuk olvasni — különben mindenki ismeretlennek
             # látszana, és a válaszok felülírnák a meglévő adatlapokat.
+            result['people'] = self.store.load_people()
+            result['persons'] = {k: p for k, p in result['people'].items()
+                                 if ctx['company'] in p['companies']}
             result['online'] = True
+            report = getattr(self.store, 'migration_report', None)
+            if report and report.get('moved'):
+                result['migration'] = report
         except Exception:
-            result['persons'] = {}
-        try:
-            result['legacy_persons'] = self.store.load_persons(None)
-        except Exception:
-            result['legacy_persons'] = {}
-        # A többi cég listája: aki ott már szerepel, annak az adatait vesszük
-        # át (egy ember minden cégnél ugyanazokkal az adatokkal szerepel).
-        try:
-            others = [c for c in self.known_companies() if c != ctx['company']]
-            result['other_persons'] = self._parallel_map(others, self.store.load_persons)
-            result['windows'] = person_sync.archive_windows(
-                self._parallel_map(self.known_companies(), self.store.load_worklog_imports))
-        except Exception:
-            result['other_persons'], result['windows'] = {}, []
+            result['people'], result['persons'] = {}, {}
         try:
             history = self.store.load_history(ctx['company'])
             result['history'] = [row for row in history if row.get('year_month') == ctx['ym']]
@@ -782,11 +773,11 @@ class App:
 
     def _on_context_loaded(self, loaded, error, ctx):
         loaded = loaded or {}
+        ctx['people'] = loaded.get('people') or {}
         ctx['persons'] = dict(loaded.get('persons') or {})
-        ctx['legacy_persons'] = loaded.get('legacy_persons') or {}
-        ctx['other_persons'] = loaded.get('other_persons') or {}
-        ctx['windows'] = loaded.get('windows') or []
         ctx['persons_online'] = bool(loaded.get('online'))
+        if loaded.get('migration'):
+            self._log_migration(loaded['migration'])
         ctx['processed_months'] = loaded.get('processed_months') or set()
 
         previous = loaded.get('history') or []
@@ -819,28 +810,39 @@ class App:
               'Folytatod a feldolgozást?',
             icon='warning')
 
+    def _log_migration(self, report):
+        """Az egyszeri átköltöztetés eredménye a naplóba (csak egyszer)."""
+        if getattr(self, '_migration_logged', False):
+            return
+        self._migration_logged = True
+        self.log(f"Személyek átköltöztetve: {report['moved']} régi adatlapból {report['people']} "
+                 'személy (egy ember = egy adatlap, a cégei listájával). A régi adatlapokról '
+                 'biztonsági mentés készült.')
+        for name, field, kept, other in report.get('conflicts') or []:
+            self.log(f'  Eltérő adat — {name}, {self.FIELD_LABELS.get(field, field)}: '
+                     f'megmaradt „{kept}”, a másik példányon „{other}” volt.')
+
     def _process_file_check_persons(self, ctx):
         if not ctx.get('persons_online'):
-            # Kapcsolat nélkül a cég személylistája nem olvasható, és a beírt
-            # adatokat menteni sem tudnánk: minden dolgozóra feleslegesen
-            # rákérdeznénk. Az adatlapok ilyenkor kitöltetlenek maradnak.
+            # Kapcsolat nélkül a személyek nem olvashatók, és a beírt adatokat
+            # menteni sem tudnánk: minden dolgozóra feleslegesen rákérdeznénk.
+            # Az adatlapok ilyenkor kitöltetlenek maradnak.
             self.log('A személylista nem érhető el: a személyi adatlapok '
                      'kitöltetlenek maradnak, és senkire nem kérdezünk rá.')
-            ctx['new_persons'] = []
+            ctx['person_saves'] = []
             self.run_async(
                 lambda: self._process_file_async(ctx),
                 lambda result, error: self._process_file_finish(ctx, result, error),
                 'Feldolgozás és mentés...')
             return
-        persons = ctx['persons']
-        ctx['persons_before'] = dict(persons)
-        legacy = ctx['legacy_persons']
+        company = ctx['company']
+        people = ctx['people']          # minden személy (egy ember = egy adatlap)
+        persons = ctx['persons']        # ebből a cég tagjai (a kimenet ebből tölt)
         all_entries = ctx['current_entries'] + ctx['future_entries']
         seen = set()
         unknown_entries = []
-        # (adatlap, régi dokumentumazonosító): régi, TAJ-alapú adatlapok,
-        # amik most megkapják az adóazonosítót (és vele az új azonosítót)
-        upgraded = []
+        # (adatlap, régi dok.azonosító vagy None, leírás) — a végén mentjük
+        saves = []
         for entry in all_entries:
             ado, taj = entry.get('adoazonosito', ''), entry.get('taj', '')
             ident = generate.ado_key(ado) or 'taj:' + generate.taj_key(taj)
@@ -851,10 +853,12 @@ class App:
             if person is None:
                 unknown_entries.append(entry)
             elif generate.ado_key(ado) and not generate.ado_key(person.get('adoazonosito')):
+                # régi, csak TAJ-os adatlap: megkapja az adóazonosítót (és vele
+                # az új azonosítót) — minden cégénél, hiszen egy adatlap
                 updated = dict(person, adoazonosito=ado)
                 del persons[key]
                 persons[FirebaseStore.person_doc_id(updated)] = updated
-                upgraded.append((updated, key))
+                saves.append((updated, key, 'upgrade'))
             elif generate.taj_key(taj) and generate.taj_key(person.get('taj')) != generate.taj_key(taj):
                 # Az adóazonosító egyezik, a TAJ nem: valószínűleg elírás. A
                 # kimenetbe a fájl TAJ-a kerül, az adatlap nem változik.
@@ -863,55 +867,54 @@ class App:
                          'alapján ugyanannak a személynek vettük; ha az adatlap a hibás, '
                          'javítsd a Személyek oldalon.')
 
-        new_persons = []
-        legacy_deletes = []
-        adopted = 0
-        asked = 0
-        skip_rest = False
-        # Minden hely (a többi cég és a régi közös lista): ha a személy ott
-        # már szerepel, rákérdezés nélkül átvesszük az adatait.
-        everywhere = dict(ctx.get('other_persons') or {})
-        everywhere[ctx['company']] = persons
-        everywhere[person_sync.LEGACY] = legacy
-        found = {id(e): person_sync.adopt(everywhere, ctx['company'], e['adoazonosito'],
-                                          e['taj'], e['nev'], ctx.get('windows') or [])
+        # Aki egy másik cégnél (vagy cég nélkül) már szerepel, annak az
+        # adatlapját kérdés nélkül ehhez a céghez is hozzárendeljük.
+        found = {id(e): person_sync.find_match(people, e['adoazonosito'], e['taj'], e['nev'])
                  for e in unknown_entries}
-        # ennyi kérdés jön (a máshol már meglévőkre nem kérdezünk)
-        to_ask = sum(1 for e in unknown_entries if found[id(e)][0] is None)
-        moves = []   # új személyenként: a régi listából vele együtt törlendők
+        to_ask = sum(1 for e in unknown_entries if found[id(e)] is None)
+        adopted = asked = 0
+        skip_rest = False
+        adopted_at = {}     # meglévő adatlap -> a mentése (egy adatlap egyszer)
         for entry in unknown_entries:
-            from_legacy = []
-            if found[id(entry)][0] is not None:
-                # Más cégnél vagy a régi közös listában már megvan: átvesszük
-                # ennek a cégnek a listájába (a régi listából áthelyezve).
-                person_data, from_legacy = found[id(entry)]
-                adopted += 1
-            elif skip_rest:
-                # „Összes kihagyása” után már nem kérdezünk — a régi listából
-                # átvehetőket (fenti ág) viszont továbbra is átvesszük.
-                continue
-            else:
-                person_data = self._ask_person_dialog(
-                    entry['nev'], entry['adoazonosito'], entry['taj'],
-                    position=(asked + 1, to_ask))
-                asked += 1
-                if person_data is SKIP_ALL:
-                    skip_rest = True
-                    self.log(f'{to_ask - asked + 1} ismeretlen személy kihagyva — az '
-                             'adatlapjuk kitöltetlen marad, legközelebb újra rákérdezünk.')
+            key = found[id(entry)]
+            if key is not None:
+                if key in adopted_at:
+                    # ugyanaz az ember még egyszer a fájlban: ugyanaz a mentés
+                    person = adopted_at[key][0]
+                    if generate.ado_key(entry['adoazonosito']) and not generate.ado_key(person.get('adoazonosito')):
+                        person['adoazonosito'] = entry['adoazonosito']
+                        persons.pop(key, None)
+                        persons[FirebaseStore.person_doc_id(person)] = person
+                        adopted_at[key][1] = key
                     continue
+                person = dict(people[key])
+                if generate.ado_key(entry['adoazonosito']) and not generate.ado_key(person.get('adoazonosito')):
+                    person['adoazonosito'] = entry['adoazonosito']
+                persons[FirebaseStore.person_doc_id(person)] = person
+                save = [person, key if FirebaseStore.person_doc_id(person) != key else None, 'adopt']
+                adopted_at[key] = save
+                saves.append(save)
+                adopted += 1
+                continue
+            if skip_rest:
+                continue
+            person_data = self._ask_person_dialog(
+                entry['nev'], entry['adoazonosito'], entry['taj'],
+                position=(asked + 1, to_ask))
+            asked += 1
+            if person_data is SKIP_ALL:
+                skip_rest = True
+                self.log(f'{to_ask - asked + 1} ismeretlen személy kihagyva — az '
+                         'adatlapjuk kitöltetlen marad, legközelebb újra rákérdezünk.')
+                continue
             if person_data:
                 persons[FirebaseStore.person_doc_id(person_data)] = person_data
-                new_persons.append(person_data)
-                moves.append([d for d in from_legacy if d not in legacy_deletes])
-                legacy_deletes += moves[-1]
+                saves.append((person_data, None, 'new'))
 
         if adopted:
-            self.log(f'{adopted} személy adatai átvéve más cégtől / a régi közös listából '
-                     f'a(z) {ctx["company"]} cég listájába.')
-        ctx['new_persons'] = new_persons
-        ctx['upgraded_persons'] = upgraded
-        ctx['new_person_moves'] = moves
+            self.log(f'{adopted} személy már szerepelt egy másik cégnél vagy cég nélkül — '
+                     f'az adatlapjuk a(z) {company} céghez is hozzá lett rendelve.')
+        ctx['person_saves'] = saves
 
         self.run_async(
             lambda: self._process_file_async(ctx),
@@ -1108,46 +1111,43 @@ class App:
         logs.append(('text', f"Rekordok a fájlból: {len(ctx['current_entries'])}, átvitt: {len(carried)}, "
                              f"jövő hónapra: {len(ctx['future_entries'])}"))
 
-        if online and (ctx.get('new_persons') or ctx.get('upgraded_persons')):
-            units = []    # (leírás, írások, törlések) — személyenként külön mentés
-            moves = ctx.get('new_person_moves') or []
-            for i, person in enumerate(ctx.get('new_persons') or []):
-                # a régi listás példány ugyanabban a lépésben törlődik, amelyben
-                # a cég listájába bekerül — sikertelen mentésnél megmarad
-                units.append((person.get('nev'), [(ctx['company'], person, None)],
-                              moves[i] if i < len(moves) else []))
-            # Az adóazonosítóval kiegészített adatlap a személy többi cégnél
-            # lévő adatlapján is kiegészül (csak az adóazonosító megy át).
-            everywhere = dict(ctx.get('other_persons') or {})
-            everywhere[ctx['company']] = dict(ctx.get('persons_before') or {})
-            everywhere[person_sync.LEGACY] = ctx.get('legacy_persons') or {}
-            for person, old_doc_id in ctx.get('upgraded_persons') or []:
-                plan = person_sync.plan_edit(everywhere, ctx['company'], old_doc_id, person)
-                if plan['collision']:
-                    plan = {'writes': [(ctx['company'], person, old_doc_id)], 'deletes': []}
-                units.append((person.get('nev'), plan['writes'], plan['deletes']))
-            saved_new = saved_upg = moved = 0
-            for name, writes, deletes in units:
+        if online and ctx.get('person_saves'):
+            counts = {'new': 0, 'upgrade': 0, 'adopt': 0}
+            for person, old_key, kind in ctx['person_saves']:
+                # személyenként külön mentés: egy hiba ne vigye el a többit
                 try:
-                    self.store.commit_person_changes(writes, deletes)
-                    if writes and writes[0][2] is None:
-                        saved_new += 1
-                    else:
-                        saved_upg += 1
-                    moved += len(deletes)
+                    self.store.save_person(ctx['company'], person, old_doc_id=old_key)
+                    counts[kind] += 1
+                    for name, field, kept, other in getattr(self.store, 'last_save_conflicts', []):
+                        logs.append(('text', f'Eltérő adat — {name}, {self.FIELD_LABELS.get(field, field)}: '
+                                             f'megmaradt „{kept}”, a másik példányon „{other}” volt.'))
                 except Exception as e:
-                    logs.append(('text', f'{name}: az adatlap mentése nem sikerült: {e}'))
-            if saved_new:
-                logs.append(('text', f"{saved_new} új személy elmentve "
-                                     f"a(z) {ctx['company']} cég listájába."))
-            if saved_upg:
-                logs.append(('text', f'{saved_upg} korábbi adatlap kiegészítve az adóazonosítóval.'))
-            if moved:
-                logs.append(('text', f'{moved} személy átkerült a régi közös listából.'))
+                    logs.append(('text', f"{person.get('nev')}: az adatlap mentése nem sikerült: {e}"))
+            if counts['new']:
+                logs.append(('text', f"{counts['new']} új személy elmentve a(z) {ctx['company']} céghez."))
+            if counts['adopt']:
+                logs.append(('text', f"{counts['adopt']} meglévő személy hozzárendelve a(z) "
+                                     f"{ctx['company']} céghez."))
+            if counts['upgrade']:
+                logs.append(('text', f"{counts['upgrade']} korábbi adatlap kiegészítve az adóazonosítóval."))
 
+        # az éves 'ki hány napot dolgozott' táblához: az év korábbi hónapjai
+        year = int(ctx['ym'][:4])
+        prior = None
+        if online:
+            try:
+                prior, missing = self._load_prior_year(ctx['company'], ctx['ym'])
+                if missing:
+                    logs.append(('text', 'Figyelem: az éves táblából hiányozhatnak ezek a hónapok '
+                                         f"(nincs mentett tartalmuk): {', '.join(missing)} — "
+                                         'a 📥 archívum-betöltés pótolhatja.'))
+            except Exception as e:
+                logs.append(('text', f'Az év korábbi hónapjai nem tölthetők be: {e}'))
+        else:
+            logs.append(('text', 'Kapcsolat nélkül az éves táblában csak a mostani hónap szerepel.'))
         output_file = generate.generate_output(
             ctx['path'], ctx['header'], ctx['data_rows'], entries,
-            fmt=ctx['format'], persons=ctx.get('persons'))
+            fmt=ctx['format'], persons=ctx.get('persons'), prior=prior, year=year)
         logs.append(('link', 'Kész! Kimenet: ', output_file))
 
         try:
@@ -1165,7 +1165,8 @@ class App:
             try:
                 history_extra = {'created_by': machine_label(), 'snapshot_id': None}
                 snapshot = generate.build_snapshot(
-                    ctx['header'], ctx['data_rows'], entries, ctx['format'])
+                    ctx['header'], ctx['data_rows'], entries, ctx['format'],
+                    prior=prior, year=year)
                 snapshot_meta = {
                     'year_month': ctx['ym'],
                     'filename': ctx['filename'],
@@ -1380,22 +1381,32 @@ class App:
             if not loaded:
                 return {'ok': False, 'reason': 'A mentett tartalom nem található.'}
             args = generate.snapshot_to_args(loaded['payload'])
-            # A személyi adatlapokat a cég jelenlegi listájából töltjük: a
-            # snapshot szándékosan nem duplikálja a személyek kollekcióját.
-            # Tartaléknak a régi közös lista szolgál — egy régi hónap
-            # személyei még csak abban lehetnek; a cég saját adata erősebb.
-            persons = {}
-            for source in (company, None):
+            # A személyi adatlapokat a jelenlegi adatlapokból töltjük: a
+            # snapshot szándékosan nem duplikálja a személyek adatait.
+            try:
+                everyone = self.store.load_people()
+                persons = {k: p for k, p in everyone.items() if company in p['companies']}
+                persons.update({k: p for k, p in everyone.items() if k not in persons})
+            except Exception:
+                persons = {}
+            # output_path megadva, ezért az első paraméter (input_path) nem
+            # számít — a névképzéshez használná, amit itt a felhasználó ad meg.
+            # Az éves táblához az év korábbi hónapjai: az újabb snapshot
+            # magában hordja őket (pontosan úgy, ahogy akkor készült), a
+            # régebbinél a mostani mentett adatokból töltjük.
+            prior, year = args.get('prior'), args.get('year')
+            ym = row.get('year_month') or ''
+            if prior is None and ym:
                 try:
-                    for doc_id, person in self.store.load_persons(source).items():
-                        persons.setdefault(doc_id, person)
+                    prior, _ = self._load_prior_year(company, ym)
+                    year = int(ym[:4])
                 except Exception:
-                    pass
+                    prior = None
             # output_path megadva, ezért az első paraméter (input_path) nem
             # számít — a névképzéshez használná, amit itt a felhasználó ad meg.
             generate.generate_output(
                 None, args['header'], args['data_rows'], args['entries'],
-                output_path=dest, fmt=args['fmt'], persons=persons)
+                output_path=dest, fmt=args['fmt'], persons=persons, prior=prior, year=year)
             return {'ok': True, 'meta': loaded['meta'], 'path': dest}
 
         self.run_async(work, self._on_history_downloaded, 'Statisztika újraépítése...')
@@ -2133,7 +2144,6 @@ class App:
             self.store.delete_all_memory(c)
             self.store.delete_all_history(c)
             self.store.delete_all_aliases(c)
-            self.store.delete_all_persons(c)
             self.store.delete_all_worklog_imports(c)
 
         def work():
@@ -2143,10 +2153,11 @@ class App:
                 companies = self.known_companies()
                 self._parallel_map(companies, wipe_company)
                 done_companies = companies
-                try:
-                    self.store.delete_all_persons(None)  # a régi közös lista
-                except Exception:
-                    pass
+                # minden személy (és a régi helyek, a mentés) egyszerre — ha ez
+                # nem sikerül, a hiba megjelenik, nem jelzünk sikert
+                for c in companies:
+                    self.store.delete_all_persons(c)
+                self.store.delete_all_people()
             return {'online': online, 'error': err, 'companies': done_companies}
 
         self.run_async(work, self._on_reset_done, 'Nullázás folyamatban...')
@@ -2200,12 +2211,17 @@ class App:
             if not online:
                 return {'online': False, 'error': err}
             companies = self.known_companies()
-            data = self._parallel_map(companies, self.store.load_persons)
-            try:
-                legacy = self.store.load_persons(None)
-            except Exception:
-                legacy = {}
-            return {'online': True, 'companies': companies, 'data': data, 'legacy': legacy}
+            # egy ember = egy adatlap: a cégek fülei ugyanannak a gyűjteménynek
+            # a szűrt nézetei (aki két cégnél dolgozik, mindkét fülön ugyanaz)
+            people = self.store.load_people()
+            companies = sorted(set(companies) | {c for p in people.values() for c in p['companies']},
+                               key=str.lower)
+            data = {c: {k: p for k, p in people.items() if c in p['companies']}
+                    for c in companies}
+            legacy = {k: p for k, p in people.items() if not p['companies']}
+            return {'online': True, 'companies': companies, 'data': data, 'legacy': legacy,
+                    'people': people,
+                    'migration': getattr(self.store, 'migration_report', None)}
 
         self.run_async(work, self._on_persons_loaded_for_page, 'Személyek betöltése...')
 
@@ -2219,8 +2235,10 @@ class App:
             self._render_page_message(page, f'A Firestore nem érhető el.{extra}')
             return
 
-        # Fülek: cégenként egy, plusz a régi közös lista, ha még van benne valami.
-        # A belső kulcs a cégnév, a régi listáé None (így hívja a store is).
+        if result.get('migration') and result['migration'].get('moved'):
+            self._log_migration(result['migration'])
+        # Fülek: cégenként egy, plusz a cég nélküli személyeké, ha van ilyen.
+        # A belső kulcs a cégnév, a cég nélkülieké None (így hívja a store is).
         tabs = [(c, c) for c in result['companies']]
         data = dict(result['data'])
         if result['legacy']:
@@ -2286,7 +2304,7 @@ class App:
         self.persons_state = {'trees': {}, 'data': data, 'company_of': company_of,
                               'switcher_state': switcher_state, 'select': select,
                               'search_var': search_var, 'results_items': {},
-                              'results_people': {}}
+                              'results_people': {}, 'people': result.get('people') or {}}
 
         cols = ('adoazonosito', 'taj', 'szul_nev', 'anya_neve', 'szul_hely_ido', 'lakcim')
         col_spec = {
@@ -2443,6 +2461,35 @@ class App:
             tree.selection_set(doc_id)
             tree.focus(doc_id)
             tree.see(doc_id)
+
+    def _load_prior_year(self, company, ym):
+        """Az év 'ym' előtti hónapjainak napjai (a cég mentett hónapjaiból,
+        hónaponként a legutolsó feldolgozásból; ahol ez nincs, az archívumból
+        betöltöttből). Visszatérés: (napok, hiányzó hónapok)."""
+        latest = worklog.latest_processing(self.store.load_history(company))
+        months = [m for m in latest if worklog.counts_for_year(m, ym)]
+        snapshots = {}
+        for m in months:
+            sid = latest[m].get('snapshot_id')
+            loaded = self.store.load_snapshot(company, sid) if sid else None
+            if loaded:
+                snapshots[m] = loaded['payload']
+        imports = self.store.load_worklog_imports(company)
+        tables = self.store.load_year_tables(company)
+        table = tables.get(ym[:4]) or {}
+        covered = set(snapshots) | set(imports)
+        missing = sorted(m for m in months if m not in covered
+                         and str(int(m[5:7])) not in (table.get('sources') or {}))
+        # az éves táblában csak névvel szereplők azonosítása (a cég tagjai előbb)
+        people = self.store.load_people()
+        ordered = sorted(people.values(), key=lambda p: company not in p['companies'])
+        names = {}
+        for p in ordered:
+            names.setdefault(person_sync.name_key(p.get('nev')),
+                             (p.get('adoazonosito', ''), p.get('taj', '')))
+        prior = worklog.prior_year_days(company, snapshots, imports, ym, year_tables=tables,
+                                        resolve=lambda nev: names.get(person_sync.name_key(nev)))
+        return prior, missing
 
     # --- Munkanapló (személyenkénti összesítés) ---
 
@@ -2628,72 +2675,46 @@ class App:
 
     def open_data_check(self):
         state = self.persons_state
-        if not state.get('data'):
+        if not state.get('people'):
             messagebox.showinfo('Adatok ellenőrzése', 'Nincsenek betöltött személyek.')
             return
-
-        def work():
-            # az archívum-betöltések időpontja: a régi (jelöletlen) adatlapoknál
-            # ebből tudjuk, melyik adatot írta az archívum
-            companies = [c for c in state['company_of'].values() if c is not None]
-            return person_sync.archive_windows(
-                self._parallel_map(companies, self.store.load_worklog_imports))
-
-        def done(windows, error):
-            if error:
-                messagebox.showerror('Hiba', f'Az adatok betöltése nem sikerült:\n{error}')
-                return
-            merges = person_sync.plan_all(state['data'], windows)
-            changes, issues = self._collect_data_check(state['company_of'], state['data'])
-            self._open_data_check_window(changes, issues, merges, windows)
-
-        self.run_async(work, done, 'Adatok ellenőrzése...')
+        changes, issues = self._collect_data_check(state['people'])
+        self._open_data_check_window(changes, issues)
 
     @staticmethod
-    def _collect_data_check(company_of, data):
-        """(javaslatok, problémák) az összes rögzített adatlapra.
+    def _companies_label(person):
+        return ', '.join(person.get('companies') or ()) or 'cég nélkül'
 
-        javaslat: (fül, cég, dok.azonosító, személy, mező, régi, új)
-        probléma: (fül, cég, dok.azonosító, személy, szöveg)
+    @staticmethod
+    def _collect_data_check(people):
+        """(javaslatok, problémák) az összes személyre — mindenki egyszer, hiszen
+        egy embernek egy adatlapja van (a cégei a 'Cég' oszlopban látszanak).
+
+        javaslat: (cégek, dok.azonosító, személy, mező, régi, új)
+        probléma: (cégek, dok.azonosító, személy, szöveg)
         """
         changes, issues = [], []
-        by_ado, by_taj = {}, {}
-        for label, company in company_of.items():
-            for doc_id, p in sorted(data[company].items(), key=lambda x: x[1].get('nev', '').lower()):
-                for field, old, new in normalize.person_changes(p):
-                    changes.append((label, company, doc_id, p, field, old, new))
-                for text in normalize.check_person(p):
-                    issues.append((label, company, doc_id, p, text))
-                ado, taj = generate.ado_key(p.get('adoazonosito')), generate.taj_key(p.get('taj'))
-                if ado:
-                    by_ado.setdefault(ado, []).append((label, company, doc_id, p))
-                if taj:
-                    by_taj.setdefault(taj, []).append((label, company, doc_id, p))
-
-        # cégeken átívelő ellentmondások
-        def norm_name(p):
-            return App._normalize_text(normalize.normalize_name(p.get('nev', '')))
-
-        for ado, group in by_ado.items():
-            names = {norm_name(p) for _, _, _, p in group}
-            if len(names) > 1:
-                listed = ', '.join(sorted({f'{p.get("nev")} ({label})' for label, _, _, p in group}))
-                for label, company, doc_id, p in group:
-                    issues.append((label, company, doc_id, p,
-                                   f'Ugyanez az adóazonosító más névvel is szerepel: {listed}'))
+        by_taj = {}
+        for doc_id, p in sorted(people.items(), key=lambda x: x[1].get('nev', '').lower()):
+            label = App._companies_label(p)
+            for field, old, new in normalize.person_changes(p):
+                changes.append((label, doc_id, p, field, old, new))
+            for text in normalize.check_person(p):
+                issues.append((label, doc_id, p, text))
+            taj = generate.taj_key(p.get('taj'))
+            if taj.isdigit():
+                by_taj.setdefault(taj, []).append((label, doc_id, p))
         for taj, group in by_taj.items():
-            ados = {generate.ado_key(p.get('adoazonosito')) for _, _, _, p in group} - {''}
-            if len(ados) > 1:
-                listed = ', '.join(sorted({f'{p.get("nev")} – {p.get("adoazonosito")} ({label})'
-                                           for label, _, _, p in group}))
-                for label, company, doc_id, p in group:
-                    issues.append((label, company, doc_id, p,
-                                   f'Ugyanez a TAJ-szám más adóazonosítóval is szerepel '
+            if len(group) > 1:
+                listed = ', '.join(sorted(f"{p.get('nev')} – {p.get('adoazonosito') or 'adóazonosító nélkül'}"
+                                          for _, _, p in group))
+                for label, doc_id, p in group:
+                    issues.append((label, doc_id, p,
+                                   f'Ugyanez a TAJ-szám más személynél is szerepel '
                                    f'(valamelyik elírás lehet): {listed}'))
         return changes, issues
 
-    def _open_data_check_window(self, changes, issues, merges=(), windows=()):
-        merges = list(merges)
+    def _open_data_check_window(self, changes, issues):
         dlg = tk.Toplevel(self.root)
         dlg.transient(self.root)
         dlg.title('Adatok ellenőrzése')
@@ -2716,85 +2737,6 @@ class App:
         nb = ttk.Notebook(dlg)
         nb.pack(fill='both', expand=True, padx=12)
 
-        # --- 0. fül: összefésülés (ugyanaz a személy több helyen) ---
-        tab0 = ttk.Frame(nb, style='Card.TFrame')
-        nb.add(tab0, text=f'  Összefésülés ({len(merges)})  ')
-        ttk.Label(tab0, text='Ugyanaz a személy több cégnél vagy a régi közös listában: minden '
-                             'cégnél ugyanazok az adatok lesznek, a régi listából átkerül. Üres '
-                             'mező kitöltődik; az archívumból jött adattal szemben a programban '
-                             'felvitt nyer. Ha két programban felvitt adat tér el („Válassz!”), '
-                             'dupla kattintással döntesz — addig mindenhol a saját marad. '
-                             'A kijelölt személyekre érvényes; alkalmazd az Egységesítés előtt.',
-                  background=COLORS['card'], foreground=COLORS['muted'], font=FONT_BASE,
-                  wraplength=820, justify='left').pack(anchor='w', padx=12, pady=(10, 0))
-        mtree = self._make_tree(tab0, ('ceg', 'mezo', 'regi', 'uj', 'forras'),
-                                {'#0': ('Név', 160), 'ceg': ('Hol', 120), 'mezo': ('Mező', 100),
-                                 'regi': ('Jelenleg', 200), 'uj': ('Ez lesz', 200),
-                                 'forras': ('Forrás', 160)},
-                                hscroll=True)
-        mtree.tag_configure('conflict', foreground=COLORS['danger'])
-        merge_of = {}       # személy-sor -> a terv sorszáma
-        conflict_of = {}    # ütközés-sor -> (sorszám, mező)
-        choices = {}        # sorszám -> {mező: választott érték}
-        current = {}        # sorszám -> a döntésekkel újraszámolt terv
-
-        def plan_at(i):
-            if i not in current:
-                current[i] = (person_sync.plan_group(merges[i]['members'], windows,
-                                                     choices=choices[i])
-                              if choices.get(i) else merges[i])
-            return current[i]
-
-        def fill_merges():
-            selected = {merge_of[r] for r in mtree.selection() if r in merge_of}
-            mtree.delete(*mtree.get_children())
-            merge_of.clear()
-            conflict_of.clear()
-            for i in range(len(merges)):
-                tag = ('odd' if i % 2 else 'even',)
-                plan = plan_at(i)
-                mine = choices.get(i, {})
-                parent = mtree.insert('', 'end', text=plan['name'], open=True, tags=tag,
-                                      values=('', '', '', '', ''))
-                merge_of[parent] = i
-                for company, field, old, new, source in plan['changes']:
-                    label = 'adatlap' if field == '*' else self.FIELD_LABELS.get(field, field)
-                    mtree.insert(parent, 'end', text='', tags=tag,
-                                 values=(gui_where(company), label, old, new, source))
-                for field, options in plan['conflicts'].items():
-                    if field in mine:
-                        continue
-                    row = mtree.insert(parent, 'end', text='', tags=('conflict',),
-                                       values=('több helyen', self.FIELD_LABELS.get(field, field),
-                                               ' | '.join(o[0] for o in options),
-                                               'Válassz! (dupla katt)',
-                                               ' | '.join(o[1] for o in options)))
-                    conflict_of[row] = (i, field)
-            if merges:
-                keep = [r for r, i in merge_of.items() if not selected or i in selected]
-                mtree.selection_set(keep)
-            else:
-                mtree.insert('', 'end', text='(Nincs összefésülendő személy.)')
-            self._autosize_columns(mtree)
-
-        def choose_conflict(_e=None):
-            sel = mtree.selection()
-            if not sel or sel[0] not in conflict_of:
-                return
-            i, field = conflict_of[sel[0]]
-            plan = plan_at(i)
-            value = self._choose_value_dialog(dlg, plan['name'], self.FIELD_LABELS.get(field, field),
-                                              plan['conflicts'][field])
-            if value is None:
-                return 'break'
-            choices.setdefault(i, {})[field] = value
-            current.pop(i, None)
-            fill_merges()
-            return 'break'
-
-        mtree.bind('<Double-1>', choose_conflict)
-        fill_merges()
-
         # --- 1. fül: egységesítési javaslatok ---
         tab1 = ttk.Frame(nb, style='Card.TFrame')
         nb.add(tab1, text=f'  Egységesítés ({len(changes)})  ')
@@ -2808,7 +2750,7 @@ class App:
                                 hscroll=True)
         change_of = {}
         for i, ch in enumerate(changes):
-            label, company, doc_id, p, field, old, new = ch
+            label, doc_id, p, field, old, new = ch
             iid = ctree.insert('', 'end', text=p.get('nev', ''),
                                values=(label, self.FIELD_LABELS.get(field, field), old, new),
                                tags=('odd' if i % 2 else 'even',))
@@ -2830,10 +2772,10 @@ class App:
                                 {'#0': ('Név', 160), 'ceg': ('Cég', 120), 'problema': ('Probléma', 520)},
                                 hscroll=True)
         issue_of = {}
-        for i, (label, company, doc_id, p, text) in enumerate(issues):
+        for i, (label, doc_id, p, text) in enumerate(issues):
             iid = itree.insert('', 'end', text=p.get('nev', ''), values=(label, text),
                                tags=('odd' if i % 2 else 'even',))
-            issue_of[iid] = (company, doc_id, p)
+            issue_of[iid] = (doc_id, p)
         if not issues:
             itree.insert('', 'end', text='(Nem találtunk problémát.)')
         self._autosize_columns(itree)
@@ -2841,82 +2783,33 @@ class App:
         def edit_issue(_e=None):
             sel = itree.selection()
             if sel and sel[0] in issue_of:
+                doc_id, p = issue_of[sel[0]]
                 dlg.destroy()
-                self._open_person_edit_dialog(*issue_of[sel[0]])
+                company = (p.get('companies') or [None])[0]
+                self._open_person_edit_dialog(company, doc_id, p)
 
         itree.bind('<Double-1>', edit_issue)
 
-        def apply_merges():
-            idx = []
-            for row in mtree.selection():
-                # egy személy alsorának kijelölése a személyt jelenti
-                row = row if row in merge_of else mtree.parent(row)
-                if row in merge_of and merge_of[row] not in idx:
-                    idx.append(merge_of[row])
-            picked = [plan_at(i) for i in idx]
-            if not picked:
-                messagebox.showinfo('Összefésülés', 'Nincs kijelölt személy.', parent=dlg)
-                return
-            writes = [w for plan in picked for w in plan['writes']]
-            deletes = [d for plan in picked for d in plan['deletes']]
-            open_conflicts = sum(1 for i in idx for f in plan_at(i)['conflicts']
-                                 if f not in choices.get(i, {}))
-            if not writes and not deletes:
-                messagebox.showinfo('Összefésülés', 'A kijelölt személyeknél csak döntés '
-                                    'vár: dupla kattintással válaszd ki az értéket.', parent=dlg)
-                return
-            text = (f'{len(picked)} személy: {len(writes)} adatlap íródik, '
-                    f'{len(deletes)} kerül át a régi közös listából.')
-            if open_conflicts:
-                text += (f'\n\n{open_conflicts} eltérésben nem döntöttél — ott mindenhol '
-                         'a saját érték marad.')
-            if not messagebox.askyesno('Összefésülés', text + '\n\nFolytatod?', parent=dlg):
-                return
-
-            def work():
-                failed = []
-                for plan in picked:     # személyenként külön mentés
-                    try:
-                        self.store.commit_person_changes(plan['writes'], plan['deletes'])
-                    except Exception as e:
-                        failed.append(f"{plan['name']}: {e}")
-                return failed
-
-            def done(failed, error):
-                if error or failed:
-                    messagebox.showerror('Hiba', 'Az összefésülés egy része nem sikerült:\n'
-                                         + (str(error) if error else '\n'.join(failed[:10])))
-                else:
-                    self.log(f'Összefésülés: {len(picked)} személy, {len(writes)} adatlap, '
-                             f'{len(deletes)} átkerült a régi közös listából.')
-                dlg.destroy()
-                self.show_persons()
-
-            self.run_async(work, done, 'Összefésülés mentése...')
-
         def apply():
-            if nb.index(nb.select()) == 0:
-                apply_merges()
-                return
             picked = [change_of[i] for i in ctree.selection() if i in change_of]
             if not picked:
                 messagebox.showinfo('Egységesítés', 'Nincs kijelölt javaslat.', parent=dlg)
                 return
             per_person = {}
-            for label, company, doc_id, p, field, old, new in picked:
-                key = (company, doc_id)
-                per_person.setdefault(key, dict(p))[field] = new
+            for label, doc_id, p, field, old, new in picked:
+                per_person.setdefault(doc_id, dict(p))[field] = new
             if not messagebox.askyesno(
                     'Egységesítés',
-                    f'{len(picked)} mező módosul {len(per_person)} adatlapon. Folytatod?',
+                    f'{len(picked)} mező módosul {len(per_person)} személynél. Folytatod?',
                     parent=dlg):
                 return
 
             def work():
                 failed = []
-                for (company, doc_id), updated in per_person.items():
+                for doc_id, updated in per_person.items():
                     try:
-                        self.store.save_person(company, updated, old_doc_id=doc_id)
+                        # cég nélkül: a tagságok változatlanok maradnak
+                        self.store.save_person(None, updated, old_doc_id=doc_id)
                     except Exception as e:
                         failed.append(f'{updated.get("nev")}: {e}')
                 return failed
@@ -2926,7 +2819,7 @@ class App:
                     messagebox.showerror('Hiba', 'Néhány adatlap mentése nem sikerült:\n'
                                          + (str(error) if error else '\n'.join(failed[:10])))
                 else:
-                    self.log(f'Egységesítés: {len(picked)} mező javítva {len(per_person)} adatlapon.')
+                    self.log(f'Egységesítés: {len(picked)} mező javítva {len(per_person)} személynél.')
                 dlg.destroy()
                 self.show_persons()
 
@@ -2934,50 +2827,12 @@ class App:
 
         ttk.Button(btns, text='Bezárás', style='Secondary.TButton',
                    command=dlg.destroy).pack(side='left', padx=6)
-        if changes or merges:
+        if changes:
             ttk.Button(btns, text='✓  Kijelöltek alkalmazása', style='Accent.TButton',
                        command=apply).pack(side='left', padx=6)
         dlg.bind('<Escape>', lambda e: dlg.destroy())
-        if merges:
-            nb.select(tab0)
-        elif changes:
-            nb.select(tab1)
-        elif issues:
+        if not changes and issues:
             nb.select(tab2)
-
-    def _choose_value_dialog(self, parent, name, field_label, options):
-        """Ütköző érték kiválasztása. Visszatérés: a választott érték vagy None."""
-        result = {'value': None}
-        win = tk.Toplevel(parent)
-        win.transient(parent)
-        win.title('Melyik a helyes?')
-        win.configure(bg=COLORS['card'])
-        win.grab_set()
-        win.resizable(False, False)
-        ttk.Label(win, text=f'{name} — {field_label}', background=COLORS['card'],
-                  font=FONT_BOLD).pack(anchor='w', padx=20, pady=(16, 4))
-        ttk.Label(win, text='Több, a programban felvitt érték tér el. A kiválasztott minden '
-                            'cégnél ez lesz:', background=COLORS['card'],
-                  foreground=COLORS['muted'], font=FONT_BASE, wraplength=460,
-                  justify='left').pack(anchor='w', padx=20, pady=(0, 8))
-        var = tk.IntVar(value=0)
-        for i, (value, source, updated) in enumerate(options):
-            when = (updated or '')[:10]
-            ttk.Radiobutton(win, text=f'{value}   —   {source}' + (f', módosítva {when}' if when else ''),
-                            variable=var, value=i).pack(anchor='w', padx=24, pady=2)
-
-        def ok():
-            result['value'] = options[var.get()][0]
-            win.destroy()
-
-        btns = ttk.Frame(win, style='Card.TFrame')
-        btns.pack(pady=(12, 16))
-        ttk.Button(btns, text='Mégse', style='Secondary.TButton', command=win.destroy).pack(side='left', padx=6)
-        ttk.Button(btns, text='Ez a helyes', style='Accent.TButton', command=ok).pack(side='left', padx=6)
-        win.bind('<Return>', lambda e: ok())
-        win.bind('<Escape>', lambda e: win.destroy())
-        win.wait_window()
-        return result['value']
 
     # --- Régi hónapok betöltése a helyi archívumból (munkanaplóhoz) ---
 
@@ -3002,17 +2857,48 @@ class App:
                 items, lambda folder: archive_import.match_company_folder(folder, known))
             result['warnings'] = warnings + result['warnings']
             result['roots'] = roots
-            # minden hely személyei: a cégek listái és a régi közös lista
-            everywhere = self._parallel_map(known, self.store.load_persons)
-            everywhere[person_sync.LEGACY] = self.store.load_persons(None)
-            windows = person_sync.archive_windows(
-                self._parallel_map(known, self.store.load_worklog_imports))
-            plans, conflicts = person_sync.plan_archive(
-                everywhere, archive_import.collect_person_details(result['imports']), windows)
-            result['persons_plan'] = {'plans': plans, 'conflicts': conflicts}
+            result['persons_plan'] = self._plan_archive_people(
+                archive_import.collect_person_details(result['imports']))
+            # a kézi (és a program által készített) munkafüzetek éves táblái
+            result['year_tables'] = archive_import.build_year_tables(
+                items, lambda folder: archive_import.match_company_folder(folder, known))
             return result
 
         self.run_async(work, self._confirm_archive_import, 'Archívum átvizsgálása...')
+
+    def _plan_archive_people(self, details):
+        """Az archívumban szereplő személyek: aki már létezik, annak csak az
+        üres mezői töltődnek ki (archív jelöléssel), és a cégéhez kerül; aki
+        nem, annak új adatlapja lesz. A programban felvitt adatot az archívum
+        nem írja felül (az eltéréseket csak megszámoljuk).
+        Visszatérés: {'saves': [(adatlap, régi dok.azonosító vagy None, új-e)],
+        'conflicts': int}."""
+        people = self.store.load_people()
+        before = {k: dict(p) for k, p in people.items()}
+        renamed = {}
+        conflicts = 0
+        for company, records in details.items():
+            for rec in records:
+                person = {'nev': rec.get('nev', ''), 'adoazonosito': rec.get('adoazonosito', ''),
+                          'taj': rec.get('taj', ''), **(rec.get('details') or {}),
+                          'archive_fields': sorted(rec.get('details') or {})}
+                key, found, old_key = person_sync.merge_into_people(
+                    people, company, person, FirebaseStore.person_doc_id)
+                conflicts += sum(1 for c in found if c[1] in person_sync.DETAIL_FIELDS
+                                 or c[1] == 'személy')
+                if old_key:
+                    renamed[key] = renamed.pop(old_key, old_key)
+        saves = []
+        for key, person in people.items():
+            original = renamed.get(key, key)
+            old = before.get(original)
+            if old is None:
+                saves.append((person, None, True))
+            elif any(old.get(f) != person.get(f) for f in person_sync.SYNC_FIELDS) \
+                    or set(old.get('companies') or ()) != set(person.get('companies') or ()) \
+                    or original != key:
+                saves.append((person, original if original != key else None, False))
+        return {'saves': saves, 'conflicts': conflicts}
 
     def _confirm_archive_import(self, result, error):
         if error:
@@ -3024,7 +2910,8 @@ class App:
             self.log(f'Archívum: {w}')
         for item in result['unresolved']:
             self.log(f"Archívum — kihagyva: {item['path']} ({item.get('reason', '')})")
-        if not imports:
+        year_tables = result.get('year_tables') or {}
+        if not imports and not year_tables:
             messagebox.showinfo('Archívum', 'Az archívumban nem találtunk betölthető hónapot.\n\n'
                                             'Átvizsgált mappák:\n' + '\n'.join(result['roots']))
             return
@@ -3037,18 +2924,22 @@ class App:
                      '(újrafeltöltött) változat.\n')
         if result['unresolved']:
             text += f"{len(result['unresolved'])} fájl nem azonosítható (lásd a naplót).\n"
-        writes = [w for pl in plan['plans'] for w in pl['writes']]
-        deletes = [d for pl in plan['plans'] for d in pl['deletes']]
-        created = sum(1 for w in writes if w[2] is None)
-        if writes or deletes:
+        saves = plan['saves']
+        created = sum(1 for s_ in saves if s_[2])
+        if saves:
             text = text.rstrip('\n') + '\n\n'
-            text += (f"Személyek az archívumból: {created} új adatlap, "
-                     f"{len(writes) - created} meglévő kiegészítése, {len(deletes)} átkerül a régi "
-                     'közös listából. Mindenki bekerül annak a cégnek a listájába, ahol a '
-                     'statisztikában szerepelt.\n')
+            text += (f"Személyek az archívumból: {created} új adatlap, {len(saves) - created} "
+                     'meglévő kiegészítése vagy hozzárendelése a cégéhez. Mindenki bekerül annak '
+                     'a cégnek a listájába, ahol a statisztikában szerepelt.\n')
             if plan['conflicts']:
-                text += (f"{plan['conflicts']} mezőben az archív adat eltér a programban "
-                         'felvitttől — ott a programban felvitt marad.\n')
+                text += 'Ahol az archív adat eltér, a programban felvitt marad.\n'
+        if year_tables:
+            text = text.rstrip('\n') + '\n\n'
+            text += 'Éves táblák („ki hány napot dolgozott”) — csak a havi statisztika nélküli hónapokhoz:\n'
+            for (company, year), table in sorted(year_tables.items()):
+                months = ', '.join(generate.MONTH_NAMES[m - 1][:3].lower() + '.'
+                                   for m in sorted(table['sources']))
+                text += f"  {company} {year}: {months}\n"
         text += ('\nA munkanaplóhoz betöltött hónapok a várakozási sorhoz és az előzményekhez '
                  'nem nyúlnak. Ahol egy hónapnak már van felhőben mentett tartalma, ott az '
                  'számít. Újbóli betöltés felülírja ugyanazt a hónapot.\n\nBetöltöd?')
@@ -3067,10 +2958,20 @@ class App:
                     })
                 except Exception as e:
                     failed.append(f'{company} {ym}: {e}')
-            try:
-                self.store.commit_person_changes(writes, deletes)
-            except Exception as e:
-                failed.append(f'személyek: {e}')
+            for (company, year), table in sorted(year_tables.items()):
+                try:
+                    self.store.save_year_table(company, year, {
+                        'sources': {m: os.path.basename(src) for m, src in table['sources'].items()},
+                        'persons': table['persons'],
+                    })
+                except Exception as e:
+                    failed.append(f'{company} {year} éves tábla: {e}')
+            for person, old_key, _ in saves:
+                try:
+                    self.store.save_person(None, person, old_doc_id=old_key,
+                                           add_companies=person.get('companies') or ())
+                except Exception as e:
+                    failed.append(f"{person.get('nev')}: {e}")
             return failed
 
         def done(failed, error):
@@ -3080,9 +2981,9 @@ class App:
                                      + (str(error) if error else '\n'.join(failed[:10])))
                 return
             summary = f'{len(imports)} hónap betöltve a munkanaplóba.'
-            if writes or deletes:
-                summary += (f"\nSzemélyek: {created} új adatlap, {len(writes) - created} "
-                            f"kiegészítve, {len(deletes)} átkerült a régi közös listából.")
+            if saves:
+                summary += (f"\nSzemélyek: {created} új adatlap, {len(saves) - created} "
+                            'kiegészítve vagy a cégéhez rendelve.')
             self.log('Archívum: ' + summary.replace('\n', ' '))
             messagebox.showinfo('Kész', summary)
             if self.current_page == 'persons':
@@ -3168,13 +3069,36 @@ class App:
         if not picked:
             return
         company, key, person = picked
-        where = f'a(z) {company} cég listájából' if company else 'a régi közös listából'
-        if not messagebox.askyesno('Törlés megerősítése',
-                                   f'Véglegesen törlöd {person.get("nev") or key} adatait {where}?'):
-            return
+        name = person.get('nev') or key
+        others = [c for c in person.get('companies') or () if c != company]
+        if company is None:
+            if not messagebox.askyesno('Törlés megerősítése',
+                                       f'Véglegesen törlöd {name} adatlapját?'):
+                return
+            remove_all = True
+        elif others:
+            # más cégnél is dolgozik: csak ebből a cégből kerül ki
+            if not messagebox.askyesno(
+                    'Kivétel a cégből',
+                    f'{name} kikerül a(z) {company} cég listájából. Az adatlapja megmarad, '
+                    f"mert a(z) {', '.join(others)} cégnél is szerepel.\n\nFolytatod?"):
+                return
+            remove_all = False
+        else:
+            answer = messagebox.askyesnocancel(
+                'Törlés megerősítése',
+                f'{name} csak a(z) {company} cégnél szerepel.\n\n'
+                'Igen: az adatlap végleges törlése.\n'
+                'Nem: csak a cégből kerül ki, az adatlap a „Cég nélküli személyek” közé kerül.')
+            if answer is None:
+                return
+            remove_all = answer
 
         def work():
-            self.store.delete_person(company, key)
+            if remove_all:
+                self.store.delete_person(None, key)
+            else:
+                self.store.remove_from_company(company, key)
 
         def done(_, error):
             if error:
@@ -3245,43 +3169,32 @@ class App:
                     + '\n\nValószínűleg elírás. Mégis elmented így?', parent=dlg):
                 return
             new_id = FirebaseStore.person_doc_id(updated)
-            others = {k: p for k, p in self.persons_state['data'][company].items() if k != doc_id}
-            if new_id in others:
-                messagebox.showwarning('Már létező személy',
-                                       f'Ezzel az azonosítóval már van adatlap ebben a listában '
-                                       f'({others[new_id].get("nev", "")}).', parent=dlg)
+            people = self.persons_state.get('people') or {}
+            if new_id != doc_id and new_id in people:
+                other = people[new_id]
+                messagebox.showwarning(
+                    'Már létező személy',
+                    f'Ezzel az azonosítóval már van egy adatlap: {other.get("nev", "")} '
+                    f'({self._companies_label(other)}).\n\nHa elírás, javítsd az azonosítót.',
+                    parent=dlg)
                 return
 
             # a kézzel átírt mezők már programban felvitt adatnak számítanak
-            # (jelöletlen régi adatlapnál: a szerkesztéssel a felhasználó
-            # minden mezőt jóváhagyott)
             updated['archive_fields'] = [f for f in person.get('archive_fields') or ()
                                          if updated.get(f) == person.get(f)]
-            # A módosított mezők a személy többi cégnél lévő adatlapjára is
-            # átkerülnek, a régi közös listás példánya pedig törlődik.
-            plan = person_sync.plan_edit(self.persons_state['data'], company, doc_id, updated)
-            if plan['collision']:
-                where, name = plan['collision']
-                messagebox.showwarning(
-                    'Már létező személy',
-                    f'Ezzel az adóazonosítóval már szerepel egy másik személy: {name} ({where}).\n\n'
-                    'Ha ugyanarról az emberről van szó, az Adatok ellenőrzése → Összefésülés '
-                    'fülön fésüld össze őket; ha elírás, javítsd az adóazonosítót.', parent=dlg)
-                return
+            # Egy ember = egy adatlap: a mentés minden cégénél egyszerre látszik.
+            others = [c for c in person.get('companies') or () if c != company]
 
             def work():
-                self.store.commit_person_changes(plan['writes'], plan['deletes'])
+                self.store.save_person(company, updated, old_doc_id=doc_id)
                 return updated
 
             def done(result, error):
                 if error:
                     messagebox.showerror('Hiba', f'Mentés sikertelen: {error}')
                     return
-                synced = sum(1 for w in plan['writes'] if w[0] != company)
-                if synced:
-                    self.log(f"{updated.get('nev')}: {synced} másik cég adatlapja is frissült.")
                 status_lbl.configure(text='✓ Elmentve'
-                                     + (f' ({synced} másik cégnél is)' if synced else ''))
+                                     + (f" (a(z) {', '.join(others)} cégnél is)" if others else ''))
                 dlg.after(700, dlg.destroy)
                 self.show_persons()
 

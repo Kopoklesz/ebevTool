@@ -29,6 +29,10 @@ class FirebaseError(Exception):
     pass
 
 
+class PersonConflict(FirebaseError):
+    """Az adatlap azonosítóján már egy MÁSIK (más nevű) személy szerepel."""
+
+
 class ConflictError(FirebaseError):
     """Egy másik gép közben módosította ugyanazt az adatot.
 
@@ -458,8 +462,28 @@ class FirebaseStore:
         return imports
 
     def delete_all_worklog_imports(self, company):
-        path = f'companies/{company}/worklog_imports'
-        self._commit([self._delete_write(f'{path}/{d["_id"]}') for d in self._list(path)])
+        for path in (f'companies/{company}/worklog_imports', f'companies/{company}/year_tables'):
+            self._commit([self._delete_write(f'{path}/{d["_id"]}') for d in self._list(path)])
+
+    # --- éves táblák (a kézi munkafüzetek 'ki hány napot dolgozott' lapjából) ---
+
+    def save_year_table(self, company, year, payload):
+        raw = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+        token = self.fernet.encrypt(raw).decode('ascii')
+        if len(token) > CHUNK_SIZE:
+            raise FirebaseError(f'A(z) {company} {year} éves táblája túl nagy a mentéshez.')
+        self._commit([self._update_write(f'companies/{company}/year_tables/{year}', {
+            'payload': token, 'imported_at': _now_iso(),
+        })])
+
+    def load_year_tables(self, company):
+        tables = {}
+        for doc in self._list(f'companies/{company}/year_tables'):
+            try:
+                tables[doc['_id']] = json.loads(self.fernet.decrypt(doc['payload'].encode('ascii')))
+            except Exception:
+                continue
+        return tables
 
     # --- cég-aliasok ---
 
@@ -475,10 +499,22 @@ class FirebaseStore:
         return sorted({doc['company'] for doc in self._list('company_aliases')
                        if doc.get('company')})
 
-    # --- személyek (adóazonosítóhoz kötött profil, titkosítva) ---
+    # --- személyek: egy ember = egy adatlap, a cégek csak hivatkoznak rá ---
+    #
+    # Minden személynek EGY adatlapja van (PEOPLE_PATH), benne a cégek
+    # listájával, ahol dolgozik. A cég "személylistája" ennek a szűrt nézete:
+    # ha valaki két cégnél dolgozik, mindkét helyen ugyanaz az adatlap
+    # látszik, így egy módosítás mindenhol egyszerre jelenik meg.
+    #
+    # A korábbi verziók cégenként külön tárolták (companies/{cég}/persons),
+    # előtte egy közös listában ('persons'). Ezeket a migrate_people()
+    # költözteti át (biztonsági másolattal); egy még frissítetlen gép által
+    # később oda írt adatlapot ugyanígy átvesz.
 
     PERSON_FIELDS = ('adoazonosito', 'taj', 'nev', 'szul_nev', 'anya_neve',
                      'szul_hely_ido', 'lakcim')
+    PEOPLE_PATH = 'companies/_szemelyek/persons'
+    BACKUP_PATH = 'companies/_szemelyek/atkoltoztetes_elotti_mentes'
 
     def _encrypt_person(self, person):
         payload = {k: person.get(k, '') for k in self.PERSON_FIELDS}
@@ -487,6 +523,8 @@ class FirebaseStore:
         # meg kell jegyezni. Hiányzó kulcs: régi adatlap, a forrás ismeretlen.
         if 'archive_fields' in person:
             payload['archive_fields'] = sorted(set(person['archive_fields'] or ()))
+        if 'companies' in person:
+            payload['companies'] = sorted(set(person['companies'] or ()), key=str.lower)
         raw = json.dumps(payload, ensure_ascii=False).encode('utf-8')
         return self.fernet.encrypt(raw).decode('ascii')
 
@@ -496,6 +534,8 @@ class FirebaseStore:
         person = {k: payload.get(k, '') for k in self.PERSON_FIELDS}
         if 'archive_fields' in payload:
             person['archive_fields'] = list(payload['archive_fields'] or ())
+        if 'companies' in payload:
+            person['companies'] = list(payload['companies'] or ())
         return person
 
     @staticmethod
@@ -507,81 +547,224 @@ class FirebaseStore:
         dokumentumok azonosítója nem változik, amíg nem kapnak adóazonosítót.
         """
         ado = ado_key(person.get('adoazonosito'))
-        source = f'ado:{ado}' if ado else taj_key(person.get('taj'))
+        taj = taj_key(person.get('taj'))
+        if ado:
+            source = f'ado:{ado}'
+        elif taj.isdigit():
+            source = taj
+        else:
+            # se adóazonosító, se értelmes TAJ ('-', 'n.a.'): a név alapján,
+            # különben az összes ilyen személy ugyanarra az azonosítóra esne
+            source = 'nev:' + ' '.join(str(person.get('nev') or '').lower().split())
         return hashlib.sha256(source.encode('utf-8')).hexdigest()[:32]
 
     @staticmethod
-    def _persons_path(company):
-        """A személyek gyűjteménye cégenként külön.
-
-        A company=None a régi, minden cégre közös 'persons' gyűjtemény: ebből
-        már nem írunk újat, csak olvassuk (átvételhez) és törölhető.
-        """
+    def _old_persons_path(company):
+        """A korábbi verziók helye: cégenként külön, vagy (None) a régi közös lista."""
         return f'companies/{company}/persons' if company else 'persons'
 
-    def load_persons(self, company):
-        """A cég személyei a dokumentumazonosítójuk szerint kulcsolva.
-
-        Kereséshez a generate.find_person való (adóazonosító, tartalékként TAJ).
-        """
+    def _load_raw_persons(self, path):
         persons = {}
-        for doc in self._list(self._persons_path(company)):
+        for doc in self._list(path):
             try:
                 person = self._decrypt_person(doc['payload'])
             except Exception:
                 continue
-            # az utolsó módosítás ideje: összefésüléskor a frissebb adat nyer
+            # az utolsó módosítás és a létrehozás ideje (az átköltöztetéskor
+            # a frissebb programos adat nyer; a régi archívum-betöltés által
+            # létrehozott adatlap a létrehozás idejéről ismerhető fel)
             person['_updated'] = doc.get('_update_time') or ''
-            # a létrehozás ideje: a korábbi archívum-betöltés által létrehozott
-            # (jelöletlen) adatlapok felismeréséhez
             person['_created'] = doc.get('_create_time') or ''
             persons[doc['_id']] = person
         return persons
 
-    def save_person(self, company, person, old_doc_id=None):
-        """Mentés; az 'old_doc_id' a személy korábbi dokumentuma.
+    def load_people(self):
+        """Az összes személy {dok.azonosító: adatlap} — az adatlap 'companies'
+        listája mondja meg, mely cégeknél dolgozik. Első hívásra (és
+        munkamenetenként egyszer) a régi helyekről is átköltöztet."""
+        if not getattr(self, '_people_migrated', False):
+            self.migrate_people()
+        people = self._load_raw_persons(self.PEOPLE_PATH)
+        for person in people.values():
+            person.setdefault('companies', [])
+        return people
 
-        Ha az azonosító megváltozott (a régi, TAJ-alapú adatlap adóazonosítót
-        kapott, vagy az adóazonosítót javították), a régi dokumentumot
-        ugyanabban a commitban töröljük, hogy ne maradjon kettőzött adatlap.
+    def load_persons(self, company):
+        """A cég személyei (company=None: akik egyik céghez sem tartoznak) —
+        ugyanazok az adatlapok, a dokumentumazonosítójuk szerint kulcsolva."""
+        return {doc_id: p for doc_id, p in self.load_people().items()
+                if (company in p['companies'] if company else not p['companies'])}
+
+    def _get_person(self, doc_id):
+        doc = self._request('GET', f'{self.PEOPLE_PATH}/{doc_id}')
+        if not doc:
+            return None
+        try:
+            return self._decrypt_person(_parse_doc(doc)['payload'])
+        except Exception:
+            return None
+
+    def save_person(self, company, person, old_doc_id=None, add_companies=()):
+        """Az adatlap mentése (egyetlen helyre), a 'company' cég tagsággal.
+
+        A tagságokat a TÁROLT adatlapból vesszük (+ 'company' + 'add_companies'),
+        a hívó esetleg elavult 'companies' listáját figyelmen kívül hagyjuk —
+        így egy közben máshol kivett cég nem kerül vissza.
+
+        Ha az azonosító megváltozott ('old_doc_id': pl. a csak TAJ-os adatlap
+        adóazonosítót kapott), a régi dokumentum ugyanabban a lépésben törlődik,
+        a tagságai átkerülnek. Ha az új azonosítón már van egy MÁSIK adatlap:
+          * azonos névvel ugyanaz az ember — a meglévő adatai maradnak, csak az
+            üres mezői töltődnek (kitöltött adatot nem írunk felül);
+          * más névvel más ember — nem írunk semmit, PersonConflict kivétel.
         """
-        path = self._persons_path(company)
+        import person_sync
+        self.last_save_conflicts = []
+        person = dict(person)
         doc_id = self.person_doc_id(person)
-        writes = [self._update_write(f'{path}/{doc_id}', {
+        stored = self._get_person(doc_id)
+        old = self._get_person(old_doc_id) if old_doc_id and old_doc_id != doc_id else None
+        if stored is not None and old_doc_id != doc_id:
+            if person_sync.name_key(stored.get('nev')) != person_sync.name_key(person.get('nev')):
+                raise PersonConflict(
+                    f"Ezzel az azonosítóval már egy másik személy szerepel: {stored.get('nev')}")
+            merged = dict(stored)
+            for field in person_sync.SYNC_FIELDS:
+                new_value = str(person.get(field) or '').strip()
+                if not str(merged.get(field) or '').strip() and new_value:
+                    merged[field] = person[field]
+                elif new_value and not person_sync.same(field, merged.get(field), new_value):
+                    # eltérő adat: a meglévő marad, a másik a naplóba kerül
+                    self.last_save_conflicts.append(
+                        (stored.get('nev', ''), field, merged.get(field, ''), person[field]))
+            merged['archive_fields'] = sorted(set(stored.get('archive_fields') or ()) |
+                                              {f for f in person.get('archive_fields') or ()
+                                               if not str(stored.get(f) or '').strip()})
+            person = merged
+        companies = set()
+        for existing in (stored, old):
+            if existing:
+                companies |= set(existing.get('companies') or ())
+        companies |= set(add_companies or ())
+        if company:
+            companies.add(company)
+        person['companies'] = sorted(companies, key=str.lower)
+        writes = [self._update_write(f'{self.PEOPLE_PATH}/{doc_id}', {
             'payload': self._encrypt_person(person),
             'updated_at': _now_iso(),
         })]
         if old_doc_id and old_doc_id != doc_id:
-            writes.append(self._delete_write(f'{path}/{old_doc_id}'))
+            writes.append(self._delete_write(f'{self.PEOPLE_PATH}/{old_doc_id}'))
         self._commit(writes)
         return doc_id
 
-    def commit_person_changes(self, writes=(), deletes=()):
-        """Több adatlap egyben: 'writes' = (cég, adatlap, régi dok.azonosító
-        vagy None), 'deletes' = (cég vagy None a régi közös listához,
-        dok.azonosító). Így egy személy minden cégnél egyszerre frissül, és a
-        régi listából átvett példány ugyanabban a lépésben törlődik."""
-        ops = []
-        written = set()
-        for company, person, old_doc_id in writes:
-            path = self._persons_path(company)
-            doc_id = self.person_doc_id(person)
-            written.add((company, doc_id))
-            ops.append(self._update_write(f'{path}/{doc_id}', {
-                'payload': self._encrypt_person(person),
-                'updated_at': _now_iso(),
-            }))
-            if old_doc_id and old_doc_id != doc_id:
-                ops.append(self._delete_write(f'{path}/{old_doc_id}'))
-        for company, doc_id in deletes:
-            if (company, doc_id) not in written:
-                ops.append(self._delete_write(f'{self._persons_path(company)}/{doc_id}'))
-        self._commit(ops)
+    def remove_from_company(self, company, doc_id):
+        """A személy kikerül a cég listájából (az adatlapja megmarad).
+        Visszatérés: a megmaradt cégek listája."""
+        person = self._get_person(doc_id)
+        if not person:
+            return []
+        person['companies'] = [c for c in person.get('companies') or () if c != company]
+        self._commit([self._update_write(f'{self.PEOPLE_PATH}/{doc_id}', {
+            'payload': self._encrypt_person(person), 'updated_at': _now_iso()})])
+        return person['companies']
 
     def delete_person(self, company, doc_id):
-        self._request('DELETE', f'{self._persons_path(company)}/{doc_id}')
+        """Törlés a cég listájából; company=None esetén az adatlap végleges törlése."""
+        if company:
+            self.remove_from_company(company, doc_id)
+        else:
+            self._request('DELETE', f'{self.PEOPLE_PATH}/{doc_id}')
 
     def delete_all_persons(self, company):
-        path = self._persons_path(company)
-        docs = self._list(path)
-        self._commit([self._delete_write(f'{path}/{d["_id"]}') for d in docs])
+        """A cég összes tagságának törlése (a régi helyén lévő adatlapokkal
+        együtt); company=None: a cég nélküli személyek törlése."""
+        old = self._old_persons_path(company)
+        writes = [self._delete_write(f'{old}/{d["_id"]}') for d in self._list(old)]
+        for doc_id, person in self._load_raw_persons(self.PEOPLE_PATH).items():
+            companies = person.get('companies') or []
+            if company and company in companies:
+                person['companies'] = [c for c in companies if c != company]
+                writes.append(self._update_write(f'{self.PEOPLE_PATH}/{doc_id}', {
+                    'payload': self._encrypt_person(person), 'updated_at': _now_iso()}))
+            elif not company and not companies:
+                writes.append(self._delete_write(f'{self.PEOPLE_PATH}/{doc_id}'))
+        self._commit(writes)
+
+    def delete_all_people(self):
+        """Minden személy és az átköltöztetési mentés törlése (nullázás)."""
+        writes = [self._delete_write(f'{path}/{d["_id"]}')
+                  for path in (self.PEOPLE_PATH, self.BACKUP_PATH, 'persons')
+                  for d in self._list(path)]
+        self._commit(writes)
+
+    def migrate_people(self, companies=None):
+        """A régi helyeken lévő adatlapok átköltöztetése az egyetlen
+        személy-gyűjteménybe. Ugyanaz az ember egy adatlap lesz, az összes
+        cég tagságával; ütközésnél a meglévő (programban felvitt) adat marad,
+        az archív eredetű helyére a programos kerül. A régi dokumentumokról
+        előbb biztonsági másolat készül (BACKUP_PATH), csak utána törlődnek.
+
+        Visszatérés: {'moved': áthelyezett adatlapok, 'people': érintett
+        személyek, 'conflicts': [(név, mező, megtartott, eltérő)]}.
+        """
+        import person_sync
+        if companies is None:
+            companies = set(self.list_companies())
+            extra = getattr(self, 'extra_companies', None)   # pl. csak helyben ismert cégek
+            if extra:
+                try:
+                    companies |= set(extra())
+                except Exception:
+                    pass
+            companies = sorted(c for c in companies if c)
+        sources = [(c, self._load_raw_persons(self._old_persons_path(c))) for c in companies]
+        sources.append((None, self._load_raw_persons(self._old_persons_path(None))))
+        old = [(c, doc_id, p) for c, docs in sources for doc_id, p in docs.items()]
+        report = {'moved': 0, 'people': 0, 'conflicts': []}
+        if not old:
+            self._people_migrated = True
+            return report
+
+        people = self._load_raw_persons(self.PEOPLE_PATH)
+        changed, renamed = set(), {}
+        # a frissebb adatlap előbb: ütközésnél az ő (programos) adata marad
+        for company, doc_id, p in sorted(old, key=lambda o: o[2].get('_updated') or '', reverse=True):
+            key, conflicts, old_key = person_sync.merge_into_people(
+                people, company, p, self.person_doc_id)
+            changed.add(key)
+            if old_key and old_key != key:
+                renamed[old_key] = key
+                changed.discard(old_key)
+            report['conflicts'] += conflicts
+
+        writes = []
+        for key in changed:
+            if key in people:          # egy későbbi átnevezés már elvihette
+                writes.append(self._update_write(f'{self.PEOPLE_PATH}/{key}', {
+                    'payload': self._encrypt_person(people[key]), 'updated_at': _now_iso()}))
+        for old_key in renamed:
+            if old_key not in people:  # közben más személy kerülhetett erre a kulcsra
+                writes.append(self._delete_write(f'{self.PEOPLE_PATH}/{old_key}'))
+        self._commit(writes)          # 1. az új helyre (ha elbukik, a régi marad)
+
+        # 2. mentés, majd törlés a régi helyről — dokumentumonként, és csak ha
+        # közben nem írták át (egy még frissítetlen gép): akkor a következő
+        # betöltéskor újra átkerül, a frissebb tartalommal
+        moved = 0
+        for company, doc_id, p in old:
+            src = f'{self._old_persons_path(company)}/{doc_id}'
+            backup_id = hashlib.sha256(src.encode('utf-8')).hexdigest()[:32]
+            try:
+                self._commit([
+                    self._update_write(f'{self.BACKUP_PATH}/{backup_id}', {
+                        'payload': self._encrypt_person(p), 'source': src, 'moved_at': _now_iso()}),
+                    self._delete_write(src, if_unchanged_since=p.get('_updated') or None),
+                ])
+                moved += 1
+            except ConflictError:
+                continue
+        report.update(moved=moved, people=len([k for k in changed if k in people]))
+        self._people_migrated = True
+        self.migration_report = report
+        return report
