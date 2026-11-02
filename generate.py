@@ -235,8 +235,11 @@ def is_hibas(row, fmt=DEFAULT_FORMAT):
 # újbóli 'Új' bejelentés pedig érvényes — a visszavonás előtti viszont nem,
 # akkor sem, ha más munkanapszámmal jelentették be.
 #
-# A régi 'e-bev' formátumban a 'törlés' jelölés magát a sort jelöli töröltnek
-# (nem egy másik bejelentést von vissza), ezért ott nincs visszavonási esemény.
+# A régi 'e-bev' formátumban is így működik: a 'Törlés' sor egy korábbi 'Új'
+# bejelentést von vissza (ugyanaz az ember, ugyanaz a kezdő nap, későbbi
+# bejelentési idő) — a valódi fájlokban az eredeti 'Új' sor megmarad mellette.
+# A hónap tehát időfolyam: bejelentés → törlés → esetleg újabb bejelentés, és
+# csak a végeredmény számít.
 
 WITHDRAW_WORDS = ('visszavon', 'törl', 'torl')
 
@@ -265,15 +268,15 @@ def _event_time(value):
 
 def row_event(row, fmt=DEFAULT_FORMAT):
     """A sor eseménytípusa: 'new' (érvényes bejelentés), 'withdraw'
-    (visszavonás/törlés), 'other' (pl. módosítás, vagy a régi formátum
-    törölt sora) vagy None (hibás sor)."""
+    (visszavonás/törlés, a régi formátum 'Törlés' sora is), 'other' (pl.
+    módosítás) vagy None (hibás sor)."""
     if is_hibas(row, fmt):
         return None
     flag = torles_value(row, fmt)
     if not flag:
         return 'new'
     if fmt.torles and fmt.torles['mode'] == 'marker':
-        return 'other'
+        return 'withdraw'
     lowered = flag.lower()
     return 'withdraw' if any(w in lowered for w in WITHDRAW_WORDS) else 'other'
 

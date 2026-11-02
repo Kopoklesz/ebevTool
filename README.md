@@ -115,8 +115,10 @@ szereplő **foglalkoztatói adószám** alapján történik.
   feldolgozás ezt naplózza, a sorban álló áthozott rekordot „visszavonva”
   állapotúra teszi (nem törli, így a hónap javított fájllal újra
   feldolgozva visszaállítható), a munkanapló pedig a korábbi hónapból is
-  kiveszi. A régi `e-bev` formátumban a „törlés” jelölés csak magát a sort
-  jelöli töröltnek, más bejelentést nem von vissza.
+  kiveszi. A régi `e-bev` formátumban is így működik: a „Törlés” sor az
+  ugyanarra az emberre és kezdő napra korábban tett „Új” bejelentést vonja
+  vissza (a hónap időrendben értendő: bejelentés → törlés → esetleg újabb
+  bejelentés, és csak a végeredmény számít).
 - **Javított hónap újrafeldolgozása**: ha a következő hónapot már
   feldolgozták, a megváltozott áthúzódó bejelentések régi változata akkor is
   törlődik, és a program szól, hogy a későbbi hónapot is futtasd újra.
